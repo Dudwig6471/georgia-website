@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Departments · Georgia State Roleplay</title>
+  <meta name="description" content="Georgia State Roleplay's whitelisted departments, how to join them, and live in-game server status.">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="nav">
+    <div class="container nav-inner">
+      <a class="brand" href="/">
+        <span class="brand-mark"><img src="assets/logo.webp" alt="" width="40" height="40"></span>
+        <span class="brand-name">Georgia State Roleplay</span>
+      </a>
+      <nav class="nav-links">
+        <a href="/#about">About</a>
+        <a href="/departments" aria-current="page">Departments</a>
+        <a href="/cad">CAD</a>
+        <!-- TODO: replace with the real Discord invite link -->
+        <a class="btn btn-small" href="#" data-discord-invite>Join Discord</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="page-hero">
+      <div class="container">
+        <p class="eyebrow">Whitelisted</p>
+        <h1>Georgia's Departments</h1>
+        <p class="lead">
+          Apply to any of our departments to become an official whitelisted member of Georgia.
+          Pick a department below and join its Discord to get started.
+        </p>
+        <ul class="rules">
+          <li>One primary department at a time. Auxiliary departments are unlimited.</li>
+          <li>Senior High Rank (SHR) is limited to one primary or auxiliary department.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="status" class="section section-tint">
+      <div class="container">
+        <div class="status-head">
+          <h2>In-game server status</h2>
+          <span class="status-pill" id="status-pill" data-state="loading">Checking…</span>
+        </div>
+        <div class="stats">
+          <div class="stat"><span class="stat-value" id="stat-players">–</span><span class="stat-label">Players</span></div>
+          <div class="stat"><span class="stat-value" id="stat-queue">–</span><span class="stat-label">In queue</span></div>
+          <div class="stat"><span class="stat-value" id="stat-staff">–</span><span class="stat-label">Staff online</span></div>
+          <div class="stat"><span class="stat-value" id="stat-code">–</span><span class="stat-label">Join code</span></div>
+        </div>
+        <p class="status-note" id="status-note">Updates every 30 seconds.</p>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container dept-grid">
+        <article class="dept" id="fcso">
+          <p class="dept-tag">Primary Department</p>
+          <h2>Fulton County Sheriff's Office</h2>
+          <p>The Fulton County Sheriff's Office (FCSO) serves Fulton County, Georgia, with a mission focused on service, public safety, and community engagement. The agency is responsible for operating the Fulton County Jail, providing security for courthouses and judges, executing arrest warrants, serving civil papers, and conducting specialized law enforcement operations and investigations. The Sheriff's Office works to uphold the law, maintain courthouse security, and support the safety of the community.</p>
+          <div class="dept-foot">
+            <a class="btn" href="https://discord.gg/T8mg7bbs8j" target="_blank" rel="noopener">Join Fulton County Sheriff's Office</a>
+            <span class="dept-count" data-team="sheriff"></span>
+          </div>
+        </article>
+
+        <article class="dept" id="gsp">
+          <p class="dept-tag">Primary Department</p>
+          <h2>Georgia State Patrol</h2>
+          <p>The Georgia State Patrol is a division of the Georgia Department of Public Safety responsible for promoting roadway safety throughout the state of Georgia. GSP troopers patrol highways and public roads, enforce traffic and criminal laws, investigate traffic crashes, assist stranded motorists, and provide support to other law enforcement agencies. Through specialized units and statewide operations, the agency works to reduce crime, prevent accidents, and protect the lives and property of Georgia residents and visitors.</p>
+          <div class="dept-foot">
+            <a class="btn" href="https://discord.gg/rshWH7TQae" target="_blank" rel="noopener">Join Georgia State Patrol</a>
+            <span class="dept-count" data-team="police"></span>
+          </div>
+        </article>
+
+        <article class="dept" id="sffr">
+          <p class="dept-tag">Auxiliary Department</p>
+          <h2>South Fulton Fire &amp; Rescue</h2>
+          <p>South Fulton Fire &amp; Rescue serves the City of South Fulton, Georgia, by providing fire protection, emergency medical response, rescue operations, and other emergency services. The department responds to structure fires, vehicle accidents, medical emergencies, hazardous conditions, and other incidents requiring immediate assistance. Through fire prevention, public education, and emergency preparedness, South Fulton Fire &amp; Rescue works to protect lives, property, and the community it serves.</p>
+          <div class="dept-foot">
+            <a class="btn" href="https://discord.gg/SEUym9Rg7" target="_blank" rel="noopener">Join South Fulton Fire &amp; Rescue</a>
+            <span class="dept-count" data-team="fire"></span>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <p>&copy; <span id="year">2026</span> Georgia State Roleplay. Not affiliated with the State of Georgia.</p>
+    </div>
+  </footer>
+
+  <script>
+    document.getElementById('year').textContent = new Date().getFullYear();
+
+    const $ = (id) => document.getElementById(id);
+    const pill = $('status-pill');
+
+    function setPill(state, label) {
+      pill.dataset.state = state;
+      pill.textContent = label;
+    }
+
+    async function loadStatus() {
+      try {
+        const res = await fetch('/api/status', { cache: 'no-store' });
+        if (!res.ok) throw new Error(res.status);
+        const s = await res.json();
+        if (!s.reachable) {
+          setPill('offline', 'Server offline');
+          ['stat-players', 'stat-queue', 'stat-staff', 'stat-code'].forEach((id) => ($(id).textContent = '–'));
+          document.querySelectorAll('.dept-count').forEach((el) => (el.textContent = ''));
+        } else {
+          setPill(s.session === 'online' ? 'online' : 'idle', s.session === 'online' ? 'Session in progress' : 'No session running');
+          $('stat-players').textContent = s.maxPlayers ? `${s.players}/${s.maxPlayers}` : s.players;
+          $('stat-queue').textContent = s.queue;
+          $('stat-staff').textContent = s.staff;
+          $('stat-code').textContent = s.joinKey || '–';
+          // In-game team counts per department card (ER:LC teams: Sheriff, Police, Fire, ...).
+          document.querySelectorAll('.dept-count').forEach((el) => {
+            const team = el.dataset.team;
+            const n = Object.entries(s.teams || {})
+              .filter(([name]) => name.toLowerCase().includes(team))
+              .reduce((sum, [, count]) => sum + count, 0);
+            el.textContent = `${n} on duty in-game`;
+          });
+        }
+        $('status-note').textContent = `Last updated ${new Date(s.updatedAt || Date.now()).toLocaleTimeString()}. Updates every 30 seconds.`;
+      } catch {
+        setPill('offline', 'Status unavailable');
+        $('status-note').textContent = "Couldn't reach the server status right now. Trying again shortly.";
+      }
+    }
+
+    loadStatus();
+    setInterval(loadStatus, 30000);
+  </script>
+</body>
+</html>

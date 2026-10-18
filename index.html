@@ -1,0 +1,1267 @@
+// GSRP CAD core: sign-in, console picker, polling, window chrome, dialogs,
+// grids, the command line, preferences and the custom icon set. The consoles
+// live in cad-*.js and register themselves on window.CAD.consoles.
+// Talks to the bot through /api/auth/... and /api/cad/... (bot/src/cad.js).
+(() => {
+  'use strict';
+
+  const C = (window.CAD = { consoles: {} });
+  const $app = document.getElementById('app');
+  const $loader = document.getElementById('loader');
+  const $toasts = document.getElementById('toasts');
+  const LOGO = 'assets/gs-logo.png';
+  const ROLE_KEY = 'gsrp_cad_role';
+  const POLL_MS = 3000;
+
+  const app = {
+    me: null,
+    role: null,
+    data: null,
+    poll: null,
+    updaters: [],
+    selectedCall: null,
+    selectedUnit: null,
+    selectedCiv: null,
+    seenCalls: null,
+    seenMessages: null,
+    lastAssigned: null,
+    panicSeen: new Set(),
+    lookup: null,
+    map: null,
+    callFilter: 'open',
+    callSort: 'priority',
+    deptFilter: 'all',
+  };
+
+  // ---------- Reference data ----------
+
+  const ROLES = {
+    civilian: { label: 'Civilian', title: 'Civilian', desc: 'Characters, licenses, DMV, bank and 911.' },
+    dispatcher: { label: 'Dispatcher', title: 'Dispatch', desc: 'Calls, units, 911 lines and the live map.' },
+    police: { label: 'Police', title: 'LEO MDT', desc: 'Calls, lookups, citations and BOLOs.' },
+    fire: { label: 'Fire / EMS', title: 'Fire/EMS MDT', desc: 'Calls, patients and fire reports.' },
+    dot: { label: 'DOT', title: 'DOT MDT', desc: 'Tows, road hazards and impounds.' },
+    law: { label: 'Law', title: 'Courts', desc: 'Records, warrants and licenses.' },
+  };
+  const UNIT_ROLES = ['police', 'fire', 'dot'];
+  const AGENCIES = {
+    police: [['Georgia State Patrol', 'GSP'], ["Fulton County Sheriff's Office", 'FCSO']],
+    fire: [['South Fulton Fire & Rescue', 'SFFR'], ['South Fulton EMS', 'EMS']],
+    dot: [['Georgia Department of Transportation', 'GDOT']],
+  };
+  const RANKS = {
+    police: ['Trooper', 'Deputy', 'Corporal', 'Sergeant', 'Lieutenant', 'Captain', 'Major', 'Colonel', 'Sheriff'],
+    fire: ['Engine', 'Ladder', 'Medic', 'Rescue', 'Battalion', 'Firefighter', 'Paramedic', 'Captain'],
+    dot: ['Tow', 'Flatbed', 'Wrecker', 'Supervisor', 'Road Crew'],
+  };
+  const STATUS = {
+    available: { code: '10-8', short: 'AVAIL', label: 'Available' },
+    enroute: { code: '10-76', short: 'ENRT', label: 'En route' },
+    onscene: { code: '10-97', short: 'ONSC', label: 'On scene' },
+    busy: { code: '10-6', short: 'BUSY', label: 'Busy' },
+    transport: { code: '10-15', short: 'TRANS', label: 'Transporting' },
+    unavailable: { code: '10-7', short: 'OOS', label: 'Out of service' },
+    panic: { code: '10-33', short: 'PANIC', label: 'Emergency' },
+  };
+  const STATUS_ORDER = ['available', 'enroute', 'onscene', 'busy', 'transport', 'unavailable', 'panic'];
+  const SETTABLE = { police: ['available', 'enroute', 'onscene', 'busy', 'transport', 'unavailable'], fire: ['available', 'enroute', 'onscene', 'transport', 'busy', 'unavailable'], dot: ['available', 'enroute', 'onscene', 'busy', 'unavailable'] };
+  const STATUS_COLOR = { available: '#00c000', enroute: '#00c8e8', onscene: '#ff3b3b', busy: '#ff9900', transport: '#b46cff', unavailable: '#808080', panic: '#ff0000' };
+
+  // Call type 10-codes: code, title, departments, priority.
+  const CALL_CODES = [
+    ['10-10', 'Fight in Progress', ['police'], 2],
+    ['10-11', 'Traffic Stop', ['police'], 3],
+    ['10-14', 'Disturbance / Noise', ['police'], 3],
+    ['10-16', 'Domestic Disturbance', ['police'], 2],
+    ['10-31', 'Crime in Progress', ['police'], 1],
+    ['10-32', 'Person with a Gun', ['police'], 1],
+    ['10-33', 'Officer Needs Assist', ['police'], 1],
+    ['10-50', 'MVA with Injuries', ['police', 'fire'], 1],
+    ['10-51', 'MVA, No Injuries', ['police', 'dot'], 3],
+    ['10-52', 'Medical / EMS Needed', ['fire'], 2],
+    ['10-53', 'Road Blocked', ['dot', 'police'], 3],
+    ['10-55', 'DUI Stop', ['police'], 2],
+    ['10-56', 'Suspicious Person', ['police'], 3],
+    ['10-57', 'Hit and Run', ['police'], 2],
+    ['10-60', 'Armed Robbery', ['police'], 1],
+    ['10-66', 'Suspicious Vehicle', ['police'], 3],
+    ['10-70', 'Fire Alarm', ['fire'], 2],
+    ['10-71', 'Structure Fire', ['fire', 'police'], 1],
+    ['10-72', 'Vehicle Fire', ['fire'], 2],
+    ['10-73', 'Smoke Investigation', ['fire'], 2],
+    ['10-80', 'Pursuit in Progress', ['police'], 1],
+    ['10-90', 'Alarm Activation', ['police'], 3],
+    ['10-91', 'Disabled Vehicle / Tow', ['dot'], 3],
+    ['10-92', 'Road Hazard', ['dot'], 4],
+    ['10-99', 'Stolen Vehicle', ['police'], 2],
+    ['LA', 'Lift Assist', ['fire'], 3],
+  ];
+  const RADIO_CODES = [
+    ['10-4', 'Acknowledged'], ['10-6', 'Busy'], ['10-7', 'Out of service'], ['10-8', 'In service / available'],
+    ['10-9', 'Repeat'], ['10-15', 'Transporting / prisoner in custody'], ['10-20', 'Location'], ['10-22', 'Disregard'],
+    ['10-23', 'Stand by'], ['10-28', 'Plate check'], ['10-29', 'Warrant check'], ['10-33', 'Emergency, all units hold'],
+    ['10-41', 'Beginning shift (clock in)'], ['10-42', 'Ending shift (clock out)'], ['10-76', 'En route'], ['10-97', 'On scene'],
+    ['Code 1', 'No lights or siren'], ['Code 2', 'Lights only'], ['Code 3', 'Lights and siren'], ['Code 4', 'Scene secure'],
+    ['Signal 100', 'Emergency traffic only'],
+  ];
+  // Penal code: title, class, fine, jail months, vehicle related.
+  const PENAL = [
+    ['Speeding (1-15 over)', 'I', 150, 0, 1], ['Speeding (16-30 over)', 'I', 300, 0, 1], ['Speeding (31+ over)', 'M', 600, 0, 1],
+    ['Failure to Stop', 'I', 200, 0, 1], ['Running a Red Light', 'I', 200, 0, 1], ['Failure to Yield', 'I', 150, 0, 1],
+    ['Failure to Signal', 'I', 100, 0, 1], ['Illegal Parking', 'I', 100, 0, 1], ['No Seatbelt', 'I', 75, 0, 1],
+    ['Expired Registration', 'I', 150, 0, 1], ['No Proof of Insurance', 'I', 250, 0, 1], ['Driving Without a License', 'M', 500, 0, 1],
+    ['Driving on a Suspended License', 'M', 750, 2, 1], ['Reckless Driving', 'M', 1000, 3, 1], ['DUI', 'M', 1000, 6, 1],
+    ['Hit and Run', 'M', 1500, 6, 1], ['Fleeing and Eluding', 'F', 2500, 12, 1], ['Disorderly Conduct', 'M', 300, 0, 0],
+    ['Criminal Trespass', 'M', 500, 2, 0], ['Obstruction of an Officer', 'M', 750, 3, 0], ['Simple Assault', 'M', 500, 3, 0],
+    ['Simple Battery', 'M', 750, 4, 0], ['Aggravated Assault', 'F', 5000, 24, 0], ['Theft by Taking', 'M', 500, 3, 0],
+    ['Motor Vehicle Theft', 'F', 3000, 18, 1], ['Burglary', 'F', 4000, 24, 0], ['Armed Robbery', 'F', 10000, 60, 0],
+    ['Possession of a Controlled Substance', 'F', 2500, 12, 0], ['Possession with Intent to Distribute', 'F', 7500, 36, 0],
+    ['Carrying a Weapon Without a License', 'M', 1000, 6, 0], ['Possession of a Firearm by a Convicted Felon', 'F', 5000, 36, 0],
+    ['Kidnapping', 'F', 15000, 120, 0], ['Murder', 'F', 25000, 300, 0],
+  ];
+  const CLASS_NAME = { I: 'Infraction', M: 'Misdemeanor', F: 'Felony' };
+  const SOURCE = { '911': '911 WEB', '311': '311 WEB', ingame: '911 ER:LC', panic: '10-33 PANIC', dispatch: 'DISPATCH', self: 'SELF-INIT' };
+  const LICENSE_NAMES = { driver: 'Driver', firearm: 'Firearm', hunting: 'Hunting', pilot: 'Pilot', boat: 'Boat', commercial: 'Commercial' };
+  const LICENSE_KINDS = Object.keys(LICENSE_NAMES);
+  const PRIORITY_NAME = { 1: 'P1 EMERGENCY', 2: 'P2 URGENT', 3: 'P3 ROUTINE', 4: 'P4 LOW' };
+
+  // ---------- Custom icons ----------
+  // A classic desktop icon set drawn for the CAD (24px grid, two-tone fills).
+
+  const O = '#22303c';
+  const ICONS = {
+    newcall: `<path d="M5 2.5h8.5l4 4V21.5H5z" fill="#fff" stroke="${O}"/><path d="M13.5 2.5v4h4" fill="#dfe6ee" stroke="${O}"/><path d="M7.5 9.5h7M7.5 12.5h7M7.5 15.5h4" stroke="#6a7b8d"/><circle cx="17.5" cy="17.5" r="4.6" fill="#2e9b48" stroke="#1b5a2a"/><path d="M17.5 15v5M15 17.5h5" stroke="#fff" stroke-width="1.7"/>`,
+    viewer: `<rect x="4.5" y="4" width="15" height="18" rx="1.5" fill="#c8913a" stroke="#6b4a1a"/><rect x="6.5" y="6.5" width="11" height="13.5" fill="#fff" stroke="#6b4a1a" stroke-width=".8"/><rect x="8.5" y="2.5" width="7" height="3.5" rx="1" fill="#a7b1bb" stroke="${O}"/><path d="M8.5 10h7M8.5 13h7M8.5 16h4.5" stroke="#6a7b8d"/>`,
+    lookup: `<circle cx="10" cy="10" r="6.2" fill="#d6ebff" stroke="${O}" stroke-width="1.6"/><path d="M7.4 8.2a3.2 3.2 0 0 1 3-2.2" stroke="#fff" stroke-width="1.5" fill="none" stroke-linecap="round"/><path d="m14.6 14.6 6 6" stroke="#6b4a1a" stroke-width="3.2" stroke-linecap="round"/>`,
+    records: `<path d="M2.5 6h7l2 2h10v12h-19z" fill="#f0c24a" stroke="#7a5a10"/><path d="M2.5 9.8h19" stroke="#7a5a10" stroke-width=".8"/><path d="M5 9.8V8h5" stroke="#fff3c4" stroke-width=".8" fill="none"/>`,
+    bolo: `<circle cx="12" cy="12" r="8.8" fill="#d8291e" stroke="#7a1410"/><circle cx="12" cy="12" r="6.6" fill="none" stroke="#ff8a7e" stroke-width=".8"/><path d="m8.6 8.6 6.8 6.8m0-6.8-6.8 6.8" stroke="#fff" stroke-width="2.3" stroke-linecap="round"/>`,
+    codes: `<path d="M3.5 4.5H11a2 2 0 0 1 2 2V21a2 2 0 0 0-2-2H3.5z" fill="#2f6fd6" stroke="#17366c"/><path d="M20.5 4.5H13a2 2 0 0 0-2 2V21a2 2 0 0 1 2-2h7.5z" fill="#4f8ced" stroke="#17366c"/><path d="M14.5 8.5h4M14.5 11.5h4M5.5 8.5h3.5" stroke="#fff" stroke-width="1.2"/>`,
+    penal: `<path d="M12 4.5V19M7.5 20.5h9" stroke="#5a4520" stroke-width="1.7" stroke-linecap="round"/><path d="M4.5 7h15" stroke="#5a4520" stroke-width="1.7" stroke-linecap="round"/><path d="M4.5 7 2 13h5zM19.5 7 17 13h5z" fill="#f2c230" stroke="#7a5a10" stroke-linejoin="round"/><circle cx="12" cy="4.3" r="1.7" fill="#f2c230" stroke="#7a5a10"/>`,
+    notepad: `<rect x="5" y="3.5" width="14" height="18" fill="#fff6b0" stroke="#7a6a20"/><path d="M5 7h14" stroke="#d8291e"/><path d="M7.5 10.5h9M7.5 13.5h9M7.5 16.5h6" stroke="#9a9a68"/><path d="M8 2v3M12 2v3M16 2v3" stroke="#555" stroke-width="1.4" stroke-linecap="round"/>`,
+    timers: `<circle cx="12" cy="13.5" r="7.6" fill="#fff" stroke="${O}" stroke-width="1.5"/><path d="M12 13.5V8.8M12 13.5l3.2 2" stroke="#d8291e" stroke-width="1.7" stroke-linecap="round"/><path d="M10 2.8h4M12 2.8v3.2M18.2 6.4l1.4-1.4" stroke="${O}" stroke-width="1.6" stroke-linecap="round"/>`,
+    map: `<path d="M2.5 5.5 8.5 3.5l7 2 6-2v15l-6 2-7-2-6 2z" fill="#86c97c" stroke="#2c5a26" stroke-linejoin="round"/><path d="M8.5 3.5v15M15.5 5.5v15" stroke="#2c5a26" stroke-width=".8"/><path d="M3 14.5c3-1.2 5 1 8.5-1s5.5-2 9.5-.8" stroke="#2f6fd6" stroke-width="1.8" fill="none"/><circle cx="12" cy="9" r="2" fill="#d8291e" stroke="#7a1410" stroke-width=".7"/>`,
+    tones: `<path d="M3.5 9.5H8l5-4.5v14l-5-4.5H3.5z" fill="#a7b1bb" stroke="${O}" stroke-linejoin="round"/><path d="M16 9a4.2 4.2 0 0 1 0 6M18.6 6.4a8 8 0 0 1 0 11.2" stroke="#2f6fd6" stroke-width="1.7" fill="none" stroke-linecap="round"/>`,
+    command: `<rect x="2.5" y="4.5" width="19" height="15" rx="1.2" fill="#1d2833" stroke="#0c1218"/><path d="M2.5 7.5h19" stroke="#3b4a58"/><path d="m6 10.5 3 2.5-3 2.5" stroke="#3cff6a" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M11 16h6" stroke="#3cff6a" stroke-width="1.7" stroke-linecap="round"/>`,
+    signal: `<path d="M12 11 8.2 21.5h7.6z" fill="none" stroke="${O}" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.6 17.5h4.8" stroke="${O}"/><circle cx="12" cy="9" r="2.1" fill="#d8291e" stroke="#7a1410"/><path d="M8 5.2a6 6 0 0 0 0 7.6M16 5.2a6 6 0 0 1 0 7.6M5.4 2.8a10 10 0 0 0 0 12.4M18.6 2.8a10 10 0 0 1 0 12.4" stroke="#d8291e" stroke-width="1.4" fill="none" stroke-linecap="round"/>`,
+    siren: `<path d="M6 17v-5a6 6 0 0 1 12 0v5z" fill="#e8321e" stroke="#7a1410"/><path d="M9 11.5a3 3 0 0 1 3-2.6" stroke="#ffb7ab" stroke-width="1.4" fill="none" stroke-linecap="round"/><rect x="4" y="17" width="16" height="3.8" rx="1" fill="#59616a" stroke="#22282e"/><path d="M12 2v2.4M4.3 5.2l1.7 1.7M19.7 5.2 18 6.9" stroke="#e8321e" stroke-width="1.7" stroke-linecap="round"/>`,
+    alert: `<circle cx="12" cy="12" r="9" fill="#d8291e" stroke="#7a1410"/><path d="M12 6.5v7" stroke="#fff" stroke-width="2.7" stroke-linecap="round"/><circle cx="12" cy="17.3" r="1.6" fill="#fff"/>`,
+    signoff: `<path d="M4.5 3h10.5v18H4.5z" fill="#c8913a" stroke="#6b4a1a"/><path d="M6.5 5h6.5v14H6.5z" fill="#d9a85a" stroke="#6b4a1a" stroke-width=".6"/><circle cx="11.8" cy="12" r="1" fill="${O}"/><path d="M15.5 12h6m-2.6-3 3 3-3 3" stroke="#d8291e" stroke-width="1.9" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`,
+    user: `<circle cx="12" cy="7.8" r="4.2" fill="#f2c9a0" stroke="#6b4a2a"/><path d="M3.8 21c0-4.6 3.7-7.6 8.2-7.6s8.2 3 8.2 7.6z" fill="#2f6fd6" stroke="#17366c"/>`,
+    useradd: `<circle cx="10" cy="7.8" r="4" fill="#f2c9a0" stroke="#6b4a2a"/><path d="M2.5 21c0-4.4 3.4-7.4 7.5-7.4s7.5 3 7.5 7.4z" fill="#2f6fd6" stroke="#17366c"/><circle cx="18" cy="16.5" r="4.4" fill="#2e9b48" stroke="#1b5a2a"/><path d="M18 14v5M15.5 16.5h5" stroke="#fff" stroke-width="1.7"/>`,
+    edit: `<path d="m4 20 1-4.6L16 4.4l3.6 3.6-11 11z" fill="#f2c230" stroke="#7a5a10" stroke-linejoin="round"/><path d="m16 4.4 3.6 3.6 1-1a1.6 1.6 0 0 0 0-2.2l-1.4-1.4a1.6 1.6 0 0 0-2.2 0z" fill="#f08a8a" stroke="#7a1410"/><path d="m4 20 1-4.6 3.6 3.6z" fill="#333"/>`,
+    trash: `<path d="M6 7h12l-1.1 14H7.1z" fill="#a7b1bb" stroke="${O}" stroke-linejoin="round"/><path d="M4 7h16M9 7V4h6v3" stroke="${O}" stroke-width="1.5" fill="none" stroke-linejoin="round"/><path d="M10 10v8M14 10v8" stroke="${O}"/>`,
+    car: `<path d="M3 15v-3l2.2-4.6h13.6L21 12v3z" fill="#2f6fd6" stroke="#17366c" stroke-linejoin="round"/><path d="M6.6 8.6h10.8l1.6 3.4H5z" fill="#d4e8ff" stroke="#17366c" stroke-width=".8"/><rect x="2.5" y="14" width="19" height="3.5" rx="1" fill="#2459b3" stroke="#17366c"/><circle cx="7" cy="18" r="2.1" fill="#222" stroke="#000"/><circle cx="17" cy="18" r="2.1" fill="#222" stroke="#000"/>`,
+    trafficstop: `<path d="M3 17v-3l2.2-4.2h13.6L21 14v3z" fill="#f4f6f8" stroke="${O}" stroke-linejoin="round"/><path d="M6.6 10.8h10.8l1.4 3H5.2z" fill="#d4e8ff" stroke="${O}" stroke-width=".8"/><rect x="8" y="6.5" width="4" height="3.2" fill="#d8291e" stroke="#7a1410" stroke-width=".7"/><rect x="12" y="6.5" width="4" height="3.2" fill="#2f6fd6" stroke="#17366c" stroke-width=".7"/><circle cx="7" cy="19" r="2" fill="#222"/><circle cx="17" cy="19" r="2" fill="#222"/><path d="M7 3.5 6 5M17 3.5l1 1.5M12 2.5V5" stroke="#d8291e" stroke-width="1.3" stroke-linecap="round"/>`,
+    gun: `<path d="M2.5 7.5h18v4.5H11.5l-1 1.2.4 6.3H6.2l.6-6.9-4.3-.6z" fill="#59616a" stroke="#22282e" stroke-linejoin="round"/><path d="M8 12.5c0 1.5 1.3 2.2 2.6 1.6" stroke="#22282e" fill="none"/><path d="M4 9.7h15" stroke="#8a939c"/>`,
+    license: `<rect x="2.5" y="5" width="19" height="14" rx="1.5" fill="#eaf2fc" stroke="#17366c"/><rect x="2.5" y="5" width="19" height="3.6" rx="1.2" fill="#2f6fd6" stroke="#17366c"/><circle cx="7.5" cy="12.6" r="2.1" fill="#a7b1bb"/><path d="M4.8 17a2.7 2.2 0 0 1 5.4 0z" fill="#a7b1bb"/><path d="M12 11.5h7M12 14h7M12 16.5h4.5" stroke="#6a7b8d"/>`,
+    dmv: `<rect x="2.5" y="7" width="19" height="10" rx="1.5" fill="#fff" stroke="#17366c"/><path d="M2.5 9.6h19" stroke="#2f6fd6" stroke-width="1.6"/><path d="M5.5 13.2h3M10.5 13.2h3M15.5 13.2h3" stroke="#17366c" stroke-width="2.2"/><circle cx="4.5" cy="15.6" r=".6" fill="#17366c"/><circle cx="19.5" cy="15.6" r=".6" fill="#17366c"/>`,
+    bank: `<path d="M12 2.8 2.8 8h18.4z" fill="#f2c230" stroke="#7a5a10" stroke-linejoin="round"/><path d="M5 9.6v7.6M9.6 9.6v7.6M14.4 9.6v7.6M19 9.6v7.6" stroke="#7a5a10" stroke-width="1.9"/><rect x="2.8" y="17.6" width="18.4" height="3.2" fill="#f2c230" stroke="#7a5a10"/>`,
+    messages: `<path d="M3 4.5h18v12H9.5L5 20.5v-4H3z" fill="#fffbe6" stroke="${O}" stroke-linejoin="round"/><path d="M6.5 8.5h11M6.5 11.5h8" stroke="#2f6fd6" stroke-width="1.4" stroke-linecap="round"/>`,
+    settings: `<path d="M10.3 2.5h3.4l.5 2.6 1.9.8 2.2-1.5 2.4 2.4-1.5 2.2.8 1.9 2.5.5v3.4l-2.5.5-.8 1.9 1.5 2.2-2.4 2.4-2.2-1.5-1.9.8-.5 2.6h-3.4l-.5-2.6-1.9-.8-2.2 1.5-2.4-2.4 1.5-2.2-.8-1.9-2.5-.5v-3.4l2.5-.5.8-1.9-1.5-2.2 2.4-2.4 2.2 1.5 1.9-.8z" fill="#a7b1bb" stroke="${O}" stroke-linejoin="round"/><circle cx="12" cy="12" r="3.3" fill="#fff" stroke="${O}"/>`,
+    layout: `<rect x="2.5" y="4" width="19" height="16" fill="#fff" stroke="${O}"/><rect x="2.5" y="4" width="19" height="3.2" fill="#2f6fd6" stroke="${O}"/><path d="M10 7.2V20M10 13.5h11.5" stroke="${O}"/><rect x="3.5" y="8.2" width="5.5" height="10.8" fill="#d4e8ff"/>`,
+    timecard: `<rect x="4" y="2.5" width="16" height="19" fill="#fff" stroke="${O}"/><circle cx="12" cy="9.5" r="4.6" fill="#eaf2fc" stroke="#2f6fd6" stroke-width="1.4"/><path d="M12 7v2.6l1.9 1.2" stroke="${O}" stroke-width="1.3" fill="none" stroke-linecap="round"/><path d="M7 16h10M7 18.5h7" stroke="#6a7b8d"/>`,
+    backup: `<circle cx="8" cy="7.6" r="3" fill="#f2c9a0" stroke="#6b4a2a"/><path d="M2.5 19c0-3.6 2.5-6 5.5-6s5.5 2.4 5.5 6z" fill="#2f6fd6" stroke="#17366c"/><circle cx="16" cy="7.6" r="3" fill="#f2c9a0" stroke="#6b4a2a"/><path d="M10.5 19c0-3.6 2.5-6 5.5-6s5.5 2.4 5.5 6z" fill="#1f4e9e" stroke="#17366c"/><circle cx="19.5" cy="4" r="2.6" fill="#d8291e" stroke="#7a1410"/>`,
+    tow: `<path d="M2.5 16V9h7l2.2 3.6h3.3V16z" fill="#f08c1a" stroke="#7a4410" stroke-linejoin="round"/><path d="M4 10.3h4.2v2.4H4z" fill="#d4e8ff" stroke="#7a4410" stroke-width=".8"/><path d="M14.8 12.6 20 6.2l1.5 1" stroke="${O}" stroke-width="1.7" fill="none"/><path d="M21.5 7.2v3.6a1.5 1.5 0 0 1-3 0" stroke="${O}" stroke-width="1.4" fill="none"/><rect x="2" y="15.5" width="15" height="2" fill="#59616a"/><circle cx="6" cy="18.6" r="2" fill="#222"/><circle cx="13.5" cy="18.6" r="2" fill="#222"/>`,
+    hazard: `<path d="M12 3 22 20.2H2z" fill="#f2c230" stroke="#7a5a10" stroke-linejoin="round"/><path d="M12 9v5.6" stroke="#222" stroke-width="2.3" stroke-linecap="round"/><circle cx="12" cy="17.4" r="1.35" fill="#222"/>`,
+    cone: `<path d="M10 3h4l4.8 15H5.2z" fill="#f08c1a" stroke="#7a4410" stroke-linejoin="round"/><path d="M8.6 9h6.8M7.3 13.5h9.4" stroke="#fff" stroke-width="1.9"/><rect x="3" y="18" width="18" height="3" rx=".6" fill="#f08c1a" stroke="#7a4410"/>`,
+    patient: `<rect x="3" y="3" width="18" height="18" rx="2.2" fill="#fff" stroke="#7a1410"/><path d="M10 6.5h4V10h3.5v4H14v3.5h-4V14H6.5v-4H10z" fill="#d8291e"/>`,
+    vitals: `<path d="M12 20.5S3 14.8 3 8.8A4.6 4.6 0 0 1 12 7a4.6 4.6 0 0 1 9 1.8c0 6-9 11.7-9 11.7z" fill="#f08a8a" stroke="#7a1410" stroke-linejoin="round"/><path d="M4 12.5h4l1.6-3 2.4 6 2-4.5 1.2 1.5H20" stroke="#7a1410" stroke-width="1.4" fill="none" stroke-linejoin="round"/>`,
+    ambulance: `<path d="M2.5 16V7h11v9z" fill="#fff" stroke="${O}"/><path d="M13.5 9.5h4.5l3.5 3.8V16h-8z" fill="#fff" stroke="${O}" stroke-linejoin="round"/><path d="M14.8 10.6h2.8l2 2.3h-4.8z" fill="#d4e8ff" stroke="${O}" stroke-width=".7"/><path d="M6.8 9v5M4.3 11.5h5" stroke="#d8291e" stroke-width="2"/><rect x="2" y="15.6" width="20" height="1.8" fill="#d8291e"/><circle cx="6.5" cy="18.5" r="2" fill="#222"/><circle cx="17" cy="18.5" r="2" fill="#222"/>`,
+    report: `<path d="M5 2.5h9l4 4V21.5H5z" fill="#fff" stroke="${O}" stroke-linejoin="round"/><path d="M14 2.5v4h4" fill="#dfe6ee" stroke="${O}"/><path d="M7.5 9.5h8M7.5 12h8M7.5 14.5h5" stroke="#6a7b8d"/><circle cx="15" cy="18" r="2.6" fill="#d8291e" stroke="#7a1410"/>`,
+    citation: `<path d="M5 2.5h14v19l-2.3-1.5-2.4 1.5-2.3-1.5-2.4 1.5L7.3 20 5 21.5z" fill="#fff" stroke="${O}" stroke-linejoin="round"/><path d="M5 6.5h14" stroke="#d8291e" stroke-width="2.2"/><path d="M7.5 10h9M7.5 12.8h9M7.5 15.6h5" stroke="#6a7b8d"/>`,
+    arrest: `<circle cx="7.5" cy="14" r="4.5" fill="none" stroke="#59616a" stroke-width="2.4"/><circle cx="16.5" cy="14" r="4.5" fill="none" stroke="#59616a" stroke-width="2.4"/><path d="M10.5 9.5c1-1.8 2-1.8 3 0" stroke="#22282e" stroke-width="1.8" fill="none"/><path d="M5.5 9.8h3.6M14.9 9.8h3.6" stroke="#22282e" stroke-width="2"/>`,
+    warrant: `<path d="M5 2.5h14v19H5z" fill="#fffdf2" stroke="${O}"/><path d="M8 6h8M8 8.6h8M8 11.2h5" stroke="#6a7b8d"/><circle cx="14.5" cy="16.5" r="3.2" fill="#f2c230" stroke="#7a5a10"/><path d="m13 19 -.8 3 2.3-1.2 2.3 1.2-.8-3" fill="#d8291e" stroke="#7a1410" stroke-width=".7"/>`,
+    pin: `<path d="M12 22s-7-7.4-7-12.4a7 7 0 0 1 14 0C19 14.6 12 22 12 22z" fill="#d8291e" stroke="#7a1410" stroke-linejoin="round"/><circle cx="12" cy="9.6" r="2.7" fill="#fff"/>`,
+    power: `<circle cx="12" cy="12" r="9" fill="#eaf2fc" stroke="${O}"/><path d="M12 6v6" stroke="#d8291e" stroke-width="2.3" stroke-linecap="round"/><path d="M8.2 8.4a5.3 5.3 0 1 0 7.6 0" stroke="#d8291e" stroke-width="2.1" fill="none" stroke-linecap="round"/>`,
+    clockin: `<circle cx="12" cy="12" r="9" fill="#eaf2fc" stroke="${O}"/><path d="M12 6.5V12l3.5 2.3" stroke="#2e9b48" stroke-width="2" fill="none" stroke-linecap="round"/>`,
+    units: `<path d="M12 2.5 4.5 5.4v5.8c0 4.8 3.2 8.8 7.5 10.3 4.3-1.5 7.5-5.5 7.5-10.3V5.4z" fill="#2f6fd6" stroke="#17366c" stroke-linejoin="round"/><path d="m12 7.2 1.5 3 3.3.5-2.4 2.3.6 3.3-3-1.6-3 1.6.6-3.3-2.4-2.3 3.3-.5z" fill="#f2c230" stroke="#7a5a10" stroke-width=".7" stroke-linejoin="round"/>`,
+    phone911: `<path d="M6.4 3.2 9.5 2.7l1.6 4.6-2.1 1.5a11 11 0 0 0 6.2 6.2l1.5-2.1 4.6 1.6-.5 3.1c-.2 1-1.1 1.6-2.1 1.6C10.6 19.2 4.8 13.4 4.8 5.3c0-1 .6-1.9 1.6-2.1z" fill="#d8291e" stroke="#7a1410" stroke-linejoin="round"/>`,
+    phone311: `<path d="M6.4 3.2 9.5 2.7l1.6 4.6-2.1 1.5a11 11 0 0 0 6.2 6.2l1.5-2.1 4.6 1.6-.5 3.1c-.2 1-1.1 1.6-2.1 1.6C10.6 19.2 4.8 13.4 4.8 5.3c0-1 .6-1.9 1.6-2.1z" fill="#2f6fd6" stroke="#17366c" stroke-linejoin="round"/>`,
+    history: `<circle cx="13" cy="12" r="8" fill="#fff" stroke="${O}" stroke-width="1.4"/><path d="M13 7.5V12l3 2" stroke="#2f6fd6" stroke-width="1.8" fill="none" stroke-linecap="round"/><path d="M2.5 9.5 5 12.5l2.8-2.8" stroke="#2e9b48" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`,
+    getcall: `<path d="M5 4.5 4 18.5M10 4.5 9 18.5M2.5 8.5h10M2 14.5h10" stroke="#2f6fd6" stroke-width="1.8" stroke-linecap="round"/><circle cx="16" cy="14" r="4" fill="#d6ebff" stroke="${O}" stroke-width="1.5"/><path d="m19 17 2.8 2.8" stroke="#6b4a1a" stroke-width="2.6" stroke-linecap="round"/>`,
+    link: `<path d="M10 14a4 4 0 0 0 5.7 0l3.4-3.4a4 4 0 0 0-5.7-5.7l-1.4 1.4" stroke="#2f6fd6" stroke-width="2.2" fill="none" stroke-linecap="round"/><path d="M14 10a4 4 0 0 0-5.7 0l-3.4 3.4a4 4 0 0 0 5.7 5.7l1.4-1.4" stroke="#17366c" stroke-width="2.2" fill="none" stroke-linecap="round"/>`,
+    tts: `<path d="M3.5 9.5H7l4.5-4v13L7 14.5H3.5z" fill="#a7b1bb" stroke="${O}" stroke-linejoin="round"/><path d="M14.5 6.5h7v8h-3l-2 2v-2h-2z" fill="#fffbe6" stroke="${O}" stroke-linejoin="round"/><path d="M16 9.4h4M16 11.6h2.8" stroke="#2f6fd6"/>`,
+    warning: `<path d="M12 3 22 20.2H2z" fill="#f2c230" stroke="#7a5a10" stroke-linejoin="round"/><path d="M12 9v5.6" stroke="#222" stroke-width="2.3" stroke-linecap="round"/><circle cx="12" cy="17.4" r="1.35" fill="#222"/>`,
+    info: `<circle cx="12" cy="12" r="9" fill="#2f6fd6" stroke="#17366c"/><circle cx="12" cy="7.5" r="1.5" fill="#fff"/><path d="M12 11v6.5" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>`,
+    help: `<circle cx="12" cy="12" r="9" fill="#2f6fd6" stroke="#17366c"/><path d="M9.3 9.3a2.8 2.8 0 1 1 3.9 2.6c-.8.4-1.2.9-1.2 1.8v.6" stroke="#fff" stroke-width="2.1" fill="none" stroke-linecap="round"/><circle cx="12" cy="17.4" r="1.4" fill="#fff"/>`,
+    check: `<circle cx="12" cy="12" r="9" fill="#2e9b48" stroke="#1b5a2a"/><path d="m7.5 12.2 3 3 6-6.4" stroke="#fff" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`,
+    renew: `<path d="M19.5 9A8 8 0 0 0 5.2 7.3M4.5 15a8 8 0 0 0 14.3 1.7" stroke="#2e9b48" stroke-width="2.2" fill="none" stroke-linecap="round"/><path d="M4.5 3.5v4.4h4.4M19.5 20.5v-4.4h-4.4" stroke="#2e9b48" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`,
+    stolen: `<path d="M3 15v-3l2.2-4.6h13.6L21 12v3z" fill="#a7b1bb" stroke="${O}" stroke-linejoin="round"/><rect x="2.5" y="14" width="19" height="3.5" rx="1" fill="#8a939c" stroke="${O}"/><circle cx="7" cy="18" r="2" fill="#222"/><circle cx="17" cy="18" r="2" fill="#222"/><circle cx="18" cy="6" r="4.3" fill="#d8291e" stroke="#7a1410"/><path d="M18 3.6v2.8" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/><circle cx="18" cy="8.3" r=".9" fill="#fff"/>`,
+    plus: `<circle cx="12" cy="12" r="9" fill="#2e9b48" stroke="#1b5a2a"/><path d="M12 7v10M7 12h10" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>`,
+    fire: `<path d="M12 22c4 0 7-3 7-7 0-5-4-7-5-12-2 2-3 4-3 6-1-1-2-2-2-4-2 2-4 5-4 10 0 4 3 7 7 7z" fill="#f08c1a" stroke="#7a1410" stroke-linejoin="round"/><path d="M12 22c-1.7 0-3-1.3-3-3 0-2 1.5-3 3-5 1.5 2 3 3 3 5 0 1.7-1.3 3-3 3z" fill="#f2d230"/>`,
+    mutualaid: `<path d="M5 21V3" stroke="${O}" stroke-width="1.8" stroke-linecap="round"/><path d="M5.8 3.5h13l-2.6 4 2.6 4h-13z" fill="#d8291e" stroke="#7a1410" stroke-linejoin="round"/><path d="M10.5 5.5v4M8.5 7.5h4" stroke="#fff" stroke-width="1.6"/>`,
+    dispatch: `<path d="M4 13.5V12a8 8 0 0 1 16 0v1.5" stroke="${O}" stroke-width="1.8" fill="none"/><rect x="2.5" y="12.5" width="5" height="7" rx="1.8" fill="#2f6fd6" stroke="#17366c"/><rect x="16.5" y="12.5" width="5" height="7" rx="1.8" fill="#2f6fd6" stroke="#17366c"/><path d="M19 19.5c0 1.6-2 2.3-4.8 2.3H13" stroke="${O}" stroke-width="1.5" fill="none"/>`,
+    gavel: `<path d="m11 3.5 6.5 6.5-2.4 2.4L8.6 5.9z" fill="#c8913a" stroke="#6b4a1a" stroke-linejoin="round"/><path d="m12.5 10.6-8 8 1.9 1.9 8-8" fill="#9b6a26" stroke="#6b4a1a" stroke-linejoin="round"/><rect x="13" y="18" width="8.5" height="3" rx=".8" fill="#59616a" stroke="#22282e"/>`,
+    refresh: `<path d="M19.5 9A8 8 0 0 0 5.2 7.3M4.5 15a8 8 0 0 0 14.3 1.7" stroke="#2f6fd6" stroke-width="2.2" fill="none" stroke-linecap="round"/><path d="M4.5 3.5v4.4h4.4M19.5 20.5v-4.4h-4.4" stroke="#2f6fd6" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`,
+    close: `<circle cx="12" cy="12" r="9" fill="#59616a" stroke="#22282e"/><path d="m8.5 8.5 7 7m0-7-7 7" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>`,
+  };
+  // Monochrome role icons for the console picker (stroke uses currentColor).
+  const ROLE_ICON = {
+    civilian: '<circle cx="12" cy="7.2" r="4"/><path d="M4 21c0-4.4 3.6-7.8 8-7.8s8 3.4 8 7.8"/>',
+    dispatcher: '<path d="M4 14v-2a8 8 0 0 1 16 0v2"/><rect x="2.5" y="13" width="4.5" height="7" rx="1.6"/><rect x="17" y="13" width="4.5" height="7" rx="1.6"/><path d="M19.2 20c0 1.4-1.8 2-4.4 2H13"/>',
+    police: '<path d="M12 2.4 4.4 5.3v5.9c0 4.9 3.3 9 7.6 10.4 4.3-1.4 7.6-5.5 7.6-10.4V5.3z"/><path d="m12 7.4 1.4 2.9 3.2.4-2.3 2.2.6 3.2L12 14.6l-2.9 1.5.6-3.2-2.3-2.2 3.2-.4z"/>',
+    fire: '<path d="M12 22c4 0 7-3 7-7 0-5-4-7-5-12-2 2-3 4-3 6-1-1-2-2-2-4-2 2-4 5-4 10 0 4 3 7 7 7z"/><path d="M12 22c-1.7 0-3-1.3-3-3 0-2 1.5-3 3-5 1.5 2 3 3 3 5 0 1.7-1.3 3-3 3z"/>',
+    dot: '<path d="M10 3h4l4.8 15H5.2z"/><path d="M8.6 9h6.8M7.3 13.5h9.4"/><path d="M3 21h18"/>',
+    law: '<path d="M12 3.5V20M7 21h10M4.5 7h15"/><path d="M4.5 7 2 13a3 3 0 0 0 5 0L4.5 7zM19.5 7 17 13a3 3 0 0 0 5 0l-2.5-6z"/>',
+  };
+
+  // Tiny glyphs for window buttons and menu checks (drawn, not font characters).
+  const GLYPH = {
+    close: '<svg viewBox="0 0 10 10" width="8" height="8" aria-hidden="true"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.7"/></svg>',
+    max: '<svg viewBox="0 0 10 10" width="9" height="8" aria-hidden="true"><rect x="1" y="1" width="8" height="7.5" fill="none" stroke="currentColor" stroke-width="1"/><path d="M1 1.8h8" stroke="currentColor" stroke-width="1.8"/></svg>',
+    min: '<svg viewBox="0 0 10 10" width="8" height="8" aria-hidden="true"><path d="M1.5 8.5h6" stroke="currentColor" stroke-width="1.8"/></svg>',
+    check: '<svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true"><path d="M1.5 5.2l2.4 2.4 4.6-5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
+  };
+
+  function icon(name, size = 24) {
+    const span = document.createElement('span');
+    span.className = 'ic';
+    span.innerHTML = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true">${ICONS[name] || ICONS.info}</svg>`;
+    return span;
+  }
+  const roleIcon = (role) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ROLE_ICON[role]}</svg>`;
+
+  // ---------- Helpers ----------
+
+  function h(tag, attrs, ...kids) {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v === null || v === undefined || v === false) continue;
+      if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+      else if (k === 'class') el.className = v;
+      else if (k === 'style') el.style.cssText = v;
+      else if (k === 'html') el.innerHTML = v; // trusted constants only (icons)
+      else if (k === 'value' && (tag === 'input' || tag === 'textarea')) el.value = v;
+      else if (v === true) el.setAttribute(k, '');
+      else el.setAttribute(k, v);
+    }
+    const add = (kid) => {
+      if (kid === null || kid === undefined || kid === false) return;
+      if (Array.isArray(kid)) kid.forEach(add);
+      else el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+    };
+    kids.forEach(add);
+    return el;
+  }
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const pad = (n) => String(n).padStart(2, '0');
+  const clock = (ts, secs) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}${secs ? `:${pad(d.getSeconds())}` : ''}`;
+  };
+  const date = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return `${pad(d.getMonth() + 1)}/${pad(d.getDate())}/${String(d.getFullYear()).slice(2)}`;
+  };
+  const stamp = (ts) => (ts ? `${date(ts)} ${clock(ts)}` : '');
+  const age = (ts) => {
+    const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    const hrs = Math.floor(s / 3600);
+    return hrs ? `${hrs}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}` : `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
+  };
+  const duration = (ms) => {
+    const m = Math.max(0, Math.round(ms / 60000));
+    return m >= 60 ? `${Math.floor(m / 60)}h ${pad(m % 60)}m` : `${m}m`;
+  };
+  const money = (n) => `${n < 0 ? '-' : ''}$${Math.abs(Math.round(n || 0)).toLocaleString()}`;
+  const since = (ts) => h('span', { 'data-since': ts }, ts ? age(ts) : '');
+  const flag = (label, color) => h('span', { class: `flag ${color || 'gray'}` }, label);
+  const up = (s) => String(s ?? '').toUpperCase();
+  const store = {
+    get: (k, session = true) => { try { return (session ? sessionStorage : localStorage).getItem(k); } catch { return null; } },
+    set: (k, v, session = true) => {
+      try {
+        const s = session ? sessionStorage : localStorage;
+        if (v === null) s.removeItem(k);
+        else s.setItem(k, v);
+      } catch { /* private mode */ }
+    },
+  };
+  const agencyShort = (u) => (AGENCIES[u.dept] || []).find(([name]) => name === u.agency)?.[1] || (u.dept ? ROLES[u.dept].label.toUpperCase() : '');
+  const statusText = (s) => (STATUS[s] ? `${STATUS[s].code} ${STATUS[s].short}` : '');
+  const statusCode = (s) => STATUS[s]?.code || '';
+  const callTitle = (c) => c.nature || 'Unknown';
+  const isOpen = (c) => c.status !== 'closed';
+  const cap = (s) => (s ? `${s[0].toUpperCase()}${s.slice(1)}` : '');
+  const licClass = (s) => (s === 'valid' ? 'green' : s === 'pending' ? 'amber' : s === 'none' || !s ? 'gray' : 'red');
+  const txClass = (s) => (s === 'valid' ? 'tx-available' : s === 'pending' ? 'tx-busy' : s === 'none' || !s ? 'tx-unavailable' : 'tx-panic');
+
+  function toast(message, kind) {
+    const el = h('div', { class: `toast ${kind || ''}` }, message);
+    $toasts.append(el);
+    setTimeout(() => el.remove(), kind === 'error' ? 6000 : 4000);
+  }
+
+  let audio;
+  function tone(seq) {
+    if (prefs().tones === false) return;
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      let t = audio.currentTime + 0.02;
+      for (const [freq, ms, gap = 40] of seq) {
+        const o = audio.createOscillator();
+        const g = audio.createGain();
+        o.type = 'square';
+        o.frequency.value = freq;
+        o.connect(g).connect(audio.destination);
+        g.gain.setValueAtTime(0.05, t);
+        g.gain.setValueAtTime(0.05, t + ms / 1000 - 0.01);
+        g.gain.linearRampToValueAtTime(0.0001, t + ms / 1000);
+        o.start(t);
+        o.stop(t + ms / 1000);
+        t += (ms + gap) / 1000;
+      }
+    } catch { /* no audio */ }
+  }
+  const TONES = {
+    alert: [[988, 140], [988, 140]],
+    panic: [[1400, 180, 60], [900, 180, 60], [1400, 180, 60], [900, 180, 60], [1400, 180, 60], [900, 180]],
+    hilo: Array.from({ length: 8 }, (_, i) => [i % 2 ? 650 : 850, 250, 0]),
+    priority: [[1000, 1200]],
+    fire: [[600, 1000, 0], [900, 3000]],
+    attention: [[1200, 90], [1200, 90], [1200, 90]],
+    message: [[1320, 70], [1760, 90]],
+  };
+
+  // Text to speech for dispatches and urgent traffic.
+  function speak(line, force) {
+    if (!force && !prefs().tts) return;
+    try {
+      if (!('speechSynthesis' in window)) return;
+      const u = new SpeechSynthesisUtterance(String(line).replace(/\b10-(\d+)/g, 'ten $1').replace(/#/g, 'number '));
+      u.rate = Number(prefs().ttsRate) || 1.05;
+      speechSynthesis.speak(u);
+    } catch { /* no speech */ }
+  }
+
+  // ---------- Preferences ----------
+
+  const DEFAULT_PREFS = {
+    tts: false, ttsRate: 1.05, tones: true, autoOpenCall: true, mdtLayout: 'tabbed', dispatchLayout: 'standard',
+    mapStyle: 'fall', mapPostals: true, hidePlayers: false, autoRoute: true, fontSize: 'normal', clock24: true,
+  };
+  function prefs() {
+    return { ...DEFAULT_PREFS, ...(app.data?.profile?.prefs || {}) };
+  }
+  async function setPrefs(changes) {
+    const next = { ...prefs(), ...changes };
+    if (app.data?.profile) app.data.profile.prefs = next;
+    applyPrefs();
+    try { await api('/api/cad/action', { method: 'POST', body: { action: 'savePrefs', prefs: next } }); } catch (err) { toast(err.message, 'error'); }
+  }
+  function applyPrefs() {
+    document.documentElement.dataset.font = prefs().fontSize;
+  }
+
+  // ---------- Loader ----------
+
+  let loaderShownAt = Date.now();
+  function showLoader(textLine) {
+    $loader.querySelector('.loader-text').textContent = textLine || 'Loading CAD…';
+    $loader.classList.remove('done');
+    loaderShownAt = Date.now();
+  }
+  async function hideLoader(minMs = 1500) {
+    await wait(Math.max(0, minMs - (Date.now() - loaderShownAt)));
+    $loader.classList.add('done');
+    $app.hidden = false;
+  }
+
+  // ---------- API ----------
+
+  async function api(path, { method = 'GET', body } = {}) {
+    const headers = {};
+    if (app.role) headers['X-CAD-Role'] = app.role;
+    if (body) {
+      headers['Content-Type'] = 'application/json';
+      headers['X-CAD'] = '1';
+    }
+    const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin', cache: 'no-store' });
+    let data = {};
+    try { data = await res.json(); } catch { /* empty */ }
+    if (res.status === 401 && path.startsWith('/api/cad/')) {
+      stopPolling();
+      closeAllDialogs();
+      renderSignIn('expired');
+      throw new Error(data.error || 'Signed out.');
+    }
+    if (!res.ok) throw new Error(data.error || (res.status >= 500 ? 'The CAD server is offline right now.' : `Request failed (${res.status}).`));
+    return data;
+  }
+
+  async function act(action, body = {}, okMessage) {
+    try {
+      const res = await api('/api/cad/action', { method: 'POST', body: { action, ...body } });
+      if (okMessage) toast(okMessage, 'ok');
+      await refresh();
+      app.lookup?.rerun();
+      return res;
+    } catch (err) {
+      toast(err.message, 'error');
+      return false;
+    }
+  }
+
+  // ---------- Dialog windows ----------
+
+  const dialogs = new Map();
+  let zTop = 100;
+
+  function openDialog({ id, title, icon: ic, width = 440, modal = false, content, onClose }) {
+    const key = id || `d${Math.random()}`;
+    if (dialogs.has(key)) {
+      const d = dialogs.get(key);
+      if (content) d.body.replaceChildren(content);
+      if (title) d.setTitle(title);
+      d.focus();
+      return d;
+    }
+    const layer = h('div', { class: `dlg-layer ${modal ? 'modal' : ''}` });
+    const body = h('div', { class: 'dlg-body' }, content);
+    const label = h('span', { class: 't-text' }, title);
+    let closed = false;
+    const d = {
+      body,
+      z: 0,
+      close: () => {
+        if (closed) return;
+        closed = true;
+        layer.remove();
+        dialogs.delete(key);
+        onClose?.();
+      },
+      focus: () => { layer.style.zIndex = String(++zTop); d.z = zTop; },
+      setTitle: (t) => { label.textContent = t; },
+    };
+    const bar = h('div', { class: 'titlebar' }, h('span', { class: 't-icon' }, ic ? icon(ic, 16) : h('img', { src: LOGO, alt: '' })), label,
+      h('button', { class: 'tb-btn', title: 'Close', 'aria-label': 'Close', onclick: () => d.close(), html: GLYPH.close }));
+    const w = Math.min(width, innerWidth - 8);
+    const win = h('div', { class: 'dlg raised', role: 'dialog', style: `width:${w}px` }, bar, body);
+    layer.append(win);
+    document.body.append(layer);
+    const n = dialogs.size;
+    win.style.left = `${Math.max(4, Math.min(innerWidth - w - 4, (innerWidth - w) / 2 + n * 22))}px`;
+    win.style.top = `${Math.max(4, Math.min(innerHeight * 0.1 + n * 22, innerHeight - 160))}px`;
+    win.addEventListener('pointerdown', () => d.focus());
+    bar.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('button')) return;
+      const startX = e.clientX - win.offsetLeft;
+      const startY = e.clientY - win.offsetTop;
+      const move = (ev) => {
+        win.style.left = `${Math.max(-w + 60, Math.min(innerWidth - 60, ev.clientX - startX))}px`;
+        win.style.top = `${Math.max(0, Math.min(innerHeight - 30, ev.clientY - startY))}px`;
+      };
+      const stop = () => { removeEventListener('pointermove', move); removeEventListener('pointerup', stop); };
+      addEventListener('pointermove', move);
+      addEventListener('pointerup', stop);
+    });
+    dialogs.set(key, d);
+    d.focus();
+    const first = body.querySelector('input:not([readonly]):not([type=checkbox]):not([type=radio]), select, textarea');
+    if (first) setTimeout(() => first.focus(), 0);
+    return d;
+  }
+
+  function closeAllDialogs() { for (const d of [...dialogs.values()]) d.close(); }
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !dialogs.size) return;
+    const top = [...dialogs.values()].sort((a, b) => b.z - a.z)[0];
+    if (top) top.close();
+  });
+
+  // fields: { name, label, type, value, options: [[value, label]], required, wide, placeholder, max, list }
+  function formDialog({ id, title, fields, submitLabel = 'OK', width = 460, danger, onSubmit, cancelLabel = 'Cancel', onCancel, icon: ic, intro }) {
+    const inputs = {};
+    const list = fields.filter(Boolean);
+    const form = h('form', { novalidate: true });
+    if (intro) form.append(h('p', { style: 'margin:0 0 8px' }, intro));
+    const groups = h('div', { class: 'groups' });
+    for (const f of list) {
+      if (f.type === 'html') { groups.append(h('div', { class: 'full' }, f.el)); continue; }
+      let input;
+      if (f.type === 'select') {
+        input = h('select', { name: f.name }, f.options.map(([v, l]) => h('option', { value: v, selected: String(f.value ?? '') === String(v) }, l)));
+      } else if (f.type === 'textarea') {
+        input = h('textarea', { name: f.name, placeholder: f.placeholder, maxlength: f.max || 2000, rows: f.rows || 4 });
+        input.value = f.value ?? '';
+      } else if (f.type === 'checkbox') {
+        input = h('input', { type: 'checkbox', name: f.name, checked: Boolean(f.value) });
+        inputs[f.name] = input;
+        groups.append(h('label', { class: `check-row ${f.wide ? 'full' : ''}` }, input, f.label));
+        continue;
+      } else {
+        input = h('input', { type: f.type || 'text', name: f.name, placeholder: f.placeholder, maxlength: f.max || 200, min: f.min, list: f.list });
+        input.value = f.value ?? '';
+      }
+      inputs[f.name] = input;
+      const wide = f.wide || f.type === 'textarea';
+      groups.append(h('div', { class: `frow ${wide ? 'full' : ''} ${f.type === 'textarea' ? 'wide' : ''}` }, h('label', null, `${f.label}:`), input));
+    }
+    form.append(groups);
+    const submit = h('button', { class: `btn btn-default ${danger ? 'btn-danger' : ''}`, type: 'submit' }, submitLabel);
+    let d;
+    const collect = () => {
+      const values = {};
+      for (const [name, input] of Object.entries(inputs)) values[name] = input.type === 'checkbox' ? input.checked : input.value.trim();
+      return values;
+    };
+    form.append(h('div', { class: 'btnrow' }, submit, h('button', { class: 'btn', type: 'button', onclick: () => (onCancel ? onCancel(d, collect()) : d.close()) }, cancelLabel)));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const missing = list.find((f) => f.required && !String(inputs[f.name].value).trim());
+      if (missing) { toast(`${missing.label} is required.`, 'error'); inputs[missing.name].focus(); return; }
+      const values = collect();
+      submit.disabled = true;
+      const ok = await onSubmit(values, inputs);
+      submit.disabled = false;
+      if (ok !== false) d.close();
+    });
+    d = openDialog({ id, title, width, modal: true, content: form, icon: ic });
+    return inputs;
+  }
+
+  function confirmDialog(title, message, label, onYes) {
+    let d;
+    const content = h('div', null,
+      h('div', { style: 'display:flex;gap:10px;align-items:flex-start' }, icon('warning', 32), h('p', { style: 'margin:4px 0 0' }, message)),
+      h('div', { class: 'btnrow' },
+        h('button', { class: 'btn btn-default btn-danger', onclick: async () => { const ok = await onYes(); if (ok !== false) d.close(); } }, label),
+        h('button', { class: 'btn', onclick: () => d.close() }, 'Cancel')));
+    d = openDialog({ title, width: 400, modal: true, content, icon: 'warning' });
+  }
+
+  // A dialog whose content re-renders when the chosen data changes.
+  function liveDialog(opts, select, render) {
+    const holder = h('div');
+    const d = openDialog({ ...opts, content: holder });
+    let key = null;
+    const upd = () => {
+      if (!document.body.contains(holder)) { app.updaters = app.updaters.filter((u) => u !== upd); return; }
+      const k = JSON.stringify(select(app.data));
+      if (k === key) return;
+      key = k;
+      holder.replaceChildren(...[render(d)].flat(Infinity).filter(Boolean));
+    };
+    app.updaters.push(upd);
+    upd();
+    return d;
+  }
+
+  // ---------- Grid ----------
+
+  function grid(cols, rows, { key = (r) => r.id, selected, onSelect, onOpen, rowClass, rowAttrs, groupBy, empty = 'No records.' } = {}) {
+    cols = cols.filter(Boolean);
+    const thead = h('thead', null, h('tr', null, cols.map((c) => h('th', { style: c.width ? `width:${c.width}` : null }, c.label))));
+    const tbody = h('tbody');
+    if (!rows.length) tbody.append(h('tr', null, h('td', { colspan: cols.length, class: 'grid-empty' }, empty)));
+    let lastGroup;
+    for (const r of rows) {
+      if (groupBy) {
+        const g = groupBy(r);
+        if (g !== lastGroup) {
+          tbody.append(h('tr', { class: 'group' }, h('td', { colspan: cols.length }, g)));
+          lastGroup = g;
+        }
+      }
+      const tr = h('tr', {
+        class: `${rowClass ? rowClass(r) : ''} ${selected !== undefined && selected !== null && key(r) === selected ? 'sel' : ''}`,
+        onclick: onSelect ? () => onSelect(r) : null,
+        ondblclick: onOpen ? () => onOpen(r) : null,
+        ...(rowAttrs ? rowAttrs(r) : {}),
+      });
+      for (const c of cols) {
+        const v = c.render ? c.render(r) : r[c.key];
+        tr.append(h('td', { class: c.cls ? c.cls(r) : null, title: typeof v === 'string' && v.length > 18 ? v : null }, v ?? ''));
+      }
+      tbody.append(tr);
+    }
+    return h('table', { class: 'grid' }, thead, tbody);
+  }
+
+  // A strip of tab buttons. items: [[key, label]].
+  function tabStrip(items, current, onPick, cls = '') {
+    return h('div', { class: `tabs ${cls}` }, items.filter(Boolean).map(([k, l]) => h('button', { class: `tab ${k === current ? 'active' : ''}`, 'data-t': k, onclick: () => onPick(k) }, l)));
+  }
+
+  // A labelled box like a classic group box.
+  const group = (legend, ...kids) => h('fieldset', { class: 'group' }, h('legend', null, legend), kids);
+  const frow = (label, el) => h('div', { class: 'frow' }, h('label', null, label), el);
+  const roField = (value, cls = '') => h('input', { value: value ?? '', readonly: true, class: `ro ${cls}` });
+
+  // ---------- Boot and sign in ----------
+
+  async function boot() {
+    const params = new URLSearchParams(location.search);
+    const error = params.get('error');
+    if (error) history.replaceState(null, '', location.pathname);
+    let me;
+    try {
+      me = await api('/api/auth/me');
+    } catch {
+      me = { signedIn: false, offline: true };
+    }
+    app.me = me;
+    if (me.offline) renderSignIn('offline');
+    else if (!me.signedIn) renderSignIn(error || (me.signInAvailable === false ? 'signin_unavailable' : null));
+    else if (!me.inGuild) renderNoGuild();
+    else {
+      const saved = store.get(ROLE_KEY);
+      if (saved && me.roles[saved]) {
+        await enterRole(saved, true);
+        return;
+      }
+      renderPicker();
+    }
+    hideLoader();
+  }
+
+  const ERRORS = {
+    cancelled: 'Sign in was cancelled.',
+    expired: 'Your session expired. Please sign in again.',
+    signin_failed: 'Discord sign in failed. Please try again.',
+    signin_unavailable: 'Discord sign in is not set up yet. Ask a server admin.',
+    offline: 'Cannot reach CAD-SRV01. The CAD server is offline right now.',
+  };
+
+  const desktop = (...kids) => h('div', { class: 'desktop' }, kids, h('div', { class: 'desk-logo' }, h('img', { src: LOGO, alt: '' }), 'GSRP Roleplay CAD'));
+  const winTitle = (label, ic) => h('div', { class: 'titlebar' }, h('span', { class: 't-icon' }, ic ? icon(ic, 16) : h('img', { src: LOGO, alt: '' })), h('span', { class: 't-text' }, label));
+
+  function renderSignIn(error) {
+    stopPolling();
+    app.role = null;
+    $app.replaceChildren(desktop(
+      h('div', { class: 'signin raised' },
+        winTitle('GSRP Roleplay CAD - Sign In'),
+        h('div', { class: 'signin-body' },
+          h('img', { src: LOGO, alt: '' }),
+          h('div', null,
+            h('h1', null, 'Georgia State Roleplay'),
+            h('p', null, "Sign in with your Discord account. You must be a member of the community's Discord server."),
+            error ? h('p', { class: 'err' }, ERRORS[error] || 'Something went wrong. Please sign in again.') : null),
+          h('div', { class: 'btnrow' },
+            h('a', { class: 'btn btn-default', href: '/api/auth/login' }, 'Sign in with Discord'),
+            h('a', { class: 'btn', href: '/' }, 'Cancel'))))));
+  }
+
+  function renderNoGuild() {
+    $app.replaceChildren(desktop(
+      h('div', { class: 'signin raised' },
+        winTitle('GSRP Roleplay CAD - Access Denied', 'warning'),
+        h('div', { class: 'signin-body' },
+          h('img', { src: LOGO, alt: '' }),
+          h('div', null,
+            h('h1', null, 'Not a member'),
+            h('p', null, `Signed in as ${app.me.user.name}, but this account is not in the Georgia State Roleplay Discord server. Join the server, then reload this page.`)),
+          h('div', { class: 'btnrow' },
+            h('a', { class: 'btn btn-default', href: '/' }, 'Go to gsrp.lol'),
+            h('button', { class: 'btn', onclick: signOut }, 'Sign Out'))))));
+  }
+
+  function renderPicker() {
+    stopPolling();
+    closeAllDialogs();
+    app.role = null;
+    const order = ['civilian', 'dispatcher', 'police', 'fire', 'dot', 'law'];
+    const buttons = order.map((key) => {
+      const r = ROLES[key];
+      const ok = app.me.roles[key];
+      return h('button', {
+        class: `console-btn cb-${key}`,
+        disabled: !ok,
+        title: ok ? `Open the ${r.title} console` : 'You need a department role for this console',
+        onclick: () => enterRole(key),
+      }, h('span', { class: 'cb-icon', html: roleIcon(key) }), h('span', { class: 'cb-text' }, h('b', null, r.label), h('small', null, ok ? r.desc : 'Locked: needs a department role.')),
+      ok ? null : h('span', { class: 'cb-lock' }, 'LOCKED'));
+    });
+    $app.replaceChildren(desktop(
+      h('div', { class: 'picker raised' },
+        winTitle(`GSRP Roleplay CAD - Select Console - ${app.me.user.name}`),
+        h('div', { class: 'picker-body' },
+          h('div', { class: 'picker-head' },
+            h('img', { src: app.me.user.avatar, alt: '', class: 'avatar' }),
+            h('div', null, h('b', null, app.me.user.name), h('small', null, `@${app.me.user.username} · Georgia State Roleplay`))),
+          h('div', { class: 'consoles' }, buttons),
+          h('div', { class: 'btnrow' },
+            h('button', { class: 'btn', onclick: signOut }, 'Sign Off'),
+            h('a', { class: 'btn', href: '/' }, 'Exit'))))));
+  }
+
+  async function signOut() {
+    stopPolling();
+    closeAllDialogs();
+    store.set(ROLE_KEY, null);
+    try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch { /* signed out anyway */ }
+    app.me = { signedIn: false };
+    renderSignIn();
+  }
+
+  async function enterRole(role, fromBoot = false) {
+    if (!fromBoot) showLoader(`Opening ${ROLES[role].title}…`);
+    app.role = role;
+    app.selectedCall = null;
+    app.selectedUnit = null;
+    app.seenCalls = null;
+    app.seenMessages = null;
+    app.lastAssigned = null;
+    app.lookup = null;
+    app.map = null;
+    try {
+      app.data = await api('/api/cad/state');
+    } catch (err) {
+      toast(err.message, 'error');
+      store.set(ROLE_KEY, null);
+      renderPicker();
+      hideLoader(fromBoot ? 1500 : 700);
+      return;
+    }
+    store.set(ROLE_KEY, role);
+    applyPrefs();
+    renderConsole();
+    notify(app.data);
+    startPolling();
+    hideLoader(fromBoot ? 1500 : 900);
+  }
+
+  async function switchConsole() {
+    if (app.data?.myUnit) await act('goOffDuty');
+    if (app.data?.myDispatch) await act('dispatchLogOff');
+    store.set(ROLE_KEY, null);
+    renderPicker();
+  }
+
+  async function signOff() {
+    if (app.data?.myUnit) await act('goOffDuty');
+    if (app.data?.myDispatch) await act('dispatchLogOff');
+    signOut();
+  }
+
+  // ---------- Polling ----------
+
+  function startPolling() {
+    stopPolling();
+    const tick = async () => {
+      await refresh();
+      if (app.role) app.poll = setTimeout(tick, document.hidden ? 15000 : POLL_MS);
+    };
+    app.poll = setTimeout(tick, POLL_MS);
+  }
+  function stopPolling() {
+    clearTimeout(app.poll);
+    app.poll = null;
+  }
+  async function refresh() {
+    if (!app.role) return;
+    try {
+      app.data = await api('/api/cad/state');
+      notify(app.data);
+      refreshNow();
+    } catch { /* keep polling */ }
+  }
+  function refreshNow() { for (const update of [...app.updaters]) update(app.data); }
+
+  setInterval(() => {
+    for (const el of document.querySelectorAll('[data-since]')) {
+      const ts = Number(el.dataset.since);
+      if (ts) el.textContent = age(ts);
+    }
+    const clk = document.getElementById('sb-clock');
+    if (clk) {
+      const d = new Date();
+      const hr = prefs().clock24 ? pad(d.getHours()) : pad(((d.getHours() + 11) % 12) + 1);
+      clk.textContent = `${hr}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${date(d)}`;
+    }
+  }, 1000);
+
+  // Alerts: new calls, panics, assignments and messages.
+  function notify(data) {
+    if (data.calls) {
+      const relevant = data.calls.filter((c) => isOpen(c) && (app.role === 'dispatcher' || c.depts.includes(app.role)));
+      if (app.seenCalls) {
+        const fresh = relevant.filter((c) => !app.seenCalls.has(c.id) && c.createdBy !== app.me.user.id);
+        for (const c of fresh) {
+          toast(`New call #${c.num}: ${[c.code, callTitle(c)].filter(Boolean).join(' ')}${c.location ? ` at ${c.location}` : ''}`);
+          if (app.role === 'dispatcher') speak(`New ${c.source === 'ingame' || c.source === '911' ? '911' : c.source === '311' ? '311' : ''} call. ${callTitle(c)}${c.postal ? `, postal ${c.postal}` : ''}.`);
+        }
+        if (fresh.length) tone(fresh.some((c) => c.priority === 1) ? TONES.priority : TONES.alert);
+      }
+      app.seenCalls = new Set(data.calls.map((c) => c.id));
+    }
+    for (const u of data.units || []) {
+      if (u.status === 'panic' && !app.panicSeen.has(u.userId + u.at)) {
+        app.panicSeen.add(u.userId + u.at);
+        tone(TONES.panic);
+        speak(`Ten thirty three. Unit ${u.callsign} emergency.`);
+      }
+    }
+    // Dispatched to a call: announce, and open it.
+    const assigned = data.myUnit?.assigned;
+    if (assigned && app.lastAssigned !== null && assigned.at !== app.lastAssigned && assigned.by) {
+      const c = (data.calls || []).find((x) => x.id === assigned.callId);
+      if (c) {
+        tone(TONES.attention);
+        toast(`Dispatched to #${c.num}: ${callTitle(c)}`, 'ok');
+        speak(`${data.myUnit.callsign}, respond to ${c.code ? `${c.code}, ` : ''}${callTitle(c)}${c.location ? `, ${c.location}` : ''}${c.postal ? `, postal ${c.postal}` : ''}.`);
+        if (prefs().autoOpenCall) {
+          app.selectedCall = c.id;
+          C.onAssigned?.(c);
+        }
+      }
+    }
+    app.lastAssigned = assigned?.at || 0;
+    // Messages.
+    const msgs = data.messages || [];
+    if (app.seenMessages) {
+      const fresh = msgs.filter((m) => !app.seenMessages.has(m.id) && m.fromId !== app.me.user.id);
+      for (const m of fresh) {
+        toast(`${m.from}: ${m.text}`, m.urgent ? 'error' : '');
+        if (m.urgent) speak(m.text);
+      }
+      if (fresh.length) tone(fresh.some((m) => m.urgent) ? TONES.attention : TONES.message);
+    }
+    app.seenMessages = new Set(msgs.map((m) => m.id));
+  }
+
+  // Re-render a container only when its data changed, so open dropdowns,
+  // typing and scroll positions survive the poll.
+  function bind(container, select, render) {
+    const update = (data) => {
+      const value = select(data);
+      const k = JSON.stringify(value);
+      if (container._key === k) return;
+      container._key = k;
+      const scroll = container.scrollTop;
+      container.replaceChildren(...[render(value, data)].flat(Infinity).filter(Boolean));
+      container.scrollTop = scroll;
+    };
+    app.updaters.push(update);
+    update(app.data);
+  }
+
+  // ---------- Console shell ----------
+
+  function child(title, { cls = '', tools, bodyClass = 'black', ic, close } = {}) {
+    const label = h('span', { class: 't-text' }, title);
+    const body = h('div', { class: `child-body ${bodyClass}` });
+    const el = h('section', { class: `child raised ${cls}` },
+      h('div', { class: 'titlebar' }, h('span', { class: 't-icon' }, ic ? icon(ic, 16) : ''), label,
+        close ? h('button', { class: 'tb-btn', title: 'Close', 'aria-label': 'Close', onclick: close, html: GLYPH.close }) : null),
+      tools ? h('div', { class: 'child-tools' }, tools) : null,
+      body);
+    return { el, body, setTitle: (t) => { label.textContent = t; } };
+  }
+
+  let menuCloser = null;
+  function menubar(menus) {
+    const bar = h('div', { class: 'menubar' });
+    const closeAll = () => bar.querySelectorAll('.menu.open').forEach((m) => m.classList.remove('open'));
+    for (const [label, items] of menus.filter(Boolean)) {
+      const list = h('div', { class: 'menu-list raised' }, items.filter(Boolean).map((it) => (it === '-' ? h('hr') : h('button', {
+        disabled: it.disabled,
+        onclick: () => { closeAll(); it.run(); },
+      }, h('span', { class: 'mi-ic' }, it.icon ? icon(it.icon, 16) : (it.checked ? h('span', { class: 'ic', html: GLYPH.check }) : '')), h('span', null, it.label), h('span', null, it.key || '')))));
+      const menu = h('div', { class: 'menu' }, h('button', {
+        onclick: (e) => {
+          const open = menu.classList.contains('open');
+          closeAll();
+          if (!open) menu.classList.add('open');
+          e.stopPropagation();
+        },
+        onmouseenter: () => { if (bar.querySelector('.menu.open') && !menu.classList.contains('open')) { closeAll(); menu.classList.add('open'); } },
+      }, h('u', null, label[0]), label.slice(1)), list);
+      bar.append(menu);
+    }
+    if (menuCloser) document.removeEventListener('click', menuCloser);
+    menuCloser = closeAll;
+    document.addEventListener('click', closeAll);
+    return bar;
+  }
+
+  function tool(label, iconName, run, { cls = '', title, disabled } = {}) {
+    return h('button', { class: `tool ${cls}`, title: title || label, onclick: run, disabled }, iconName instanceof Node ? h('span', { class: 'ic' }, iconName) : icon(iconName), h('span', null, label));
+  }
+  const sep = () => h('span', { class: 'tool-sep' });
+  const d100 = () => Boolean(app.data?.signal100);
+
+  // Builds the main window and returns the workspace to fill.
+  function shell({ menus, tools, topbar, hint, workspaceClass, commands = true, statusItems, titleSuffix }) {
+    const r = ROLES[app.role];
+    const titleText = h('span', { class: 't-text' });
+    const setTitle = () => {
+      const u = UNIT_ROLES.includes(app.role) ? app.data.myUnit : null;
+      const dsp = app.role === 'dispatcher' ? app.data.myDispatch : null;
+      const who = u ? `${u.callsign} ${u.rank ? `${u.rank.toUpperCase()} ` : ''}${app.me.user.name.toUpperCase()}${u.agency ? ` [${agencyShort(u)}]` : ''}`
+        : dsp ? `${dsp.callsign} ${app.me.user.name.toUpperCase()}` : app.me.user.name.toUpperCase();
+      titleText.textContent = `GSRP CAD - ${r.title}${dsp ? ` [Console ${dsp.console || 1}]` : ''}${titleSuffix ? ` ${titleSuffix}` : ''} - ${who}`;
+    };
+    setTitle();
+    const banners = h('div');
+    const workspace = h('div', { class: `workspace ${workspaceClass}` });
+    const status = h('div', { class: 'statusbar' });
+    const win = h('div', { class: `mainwin role-${app.role}` },
+      h('div', { class: 'titlebar' }, h('span', { class: 't-icon' }, h('img', { src: LOGO, alt: '' })), titleText,
+        h('button', { class: 'tb-btn', title: 'Switch console', 'aria-label': 'Switch console', onclick: switchConsole, html: GLYPH.min }),
+        h('button', { class: 'tb-btn', title: 'Full screen', 'aria-label': 'Full screen', onclick: fullScreen, html: GLYPH.max }),
+        h('button', { class: 'tb-btn', title: 'Sign off', 'aria-label': 'Sign off', onclick: signOff, html: GLYPH.close })),
+      menubar(menus),
+      tools ? h('div', { class: 'toolbar' }, tools) : null,
+      topbar || null,
+      commands ? commandRow(hint) : null,
+      banners,
+      workspace,
+      status);
+    $app.replaceChildren(win);
+    app.updaters.push(setTitle);
+
+    bind(banners, (d) => ({
+      panic: (d.units || []).filter((u) => u.status === 'panic').map((u) => ({ id: u.userId, cs: u.callsign, name: u.name, agency: agencyShort(u), rank: u.rank, loc: u.location, postal: u.postal, at: u.at, ack: u.panicAck, ackBy: u.panicAckBy, call: (d.calls || []).find((c) => isOpen(c) && c.units.some((x) => x.userId === u.userId))?.num })),
+      s100: d.signal100,
+      notice: d.profile?.notice,
+    }), ({ panic, s100, notice }) => [
+      notice ? h('div', { class: 'banner notice' }, icon('info', 18), h('span', { class: 'msg' }, notice.text), h('button', { class: 'btn', onclick: () => act('clearNotice') }, 'OK')) : null,
+      panic.map((p) => h('div', { class: `banner panic ${p.ack ? '' : 'unacked'}` },
+        h('span', { class: 'code' }, '10-33'),
+        h('span', { class: 'msg' }, `PANIC ACTIVATION - UNIT ${p.cs} ${p.rank ? `${up(p.rank)} ` : ''}${up(p.name)}${p.agency ? ` (${p.agency})` : ''}${p.loc ? ` - ${up(p.loc)}` : ''}${p.postal ? ` - POSTAL ${p.postal}` : ''} - ${clock(p.at)}${p.call ? ` - ON CALL #${p.call}` : ''}${p.ack ? ` - ACK BY ${up(p.ackBy)}` : ''}`),
+        app.role === 'dispatcher' && !p.ack ? h('button', { class: 'btn', onclick: () => act('ackPanic', { userId: p.id }) }, 'Acknowledge') : null,
+        h('button', { class: 'btn', onclick: () => { const c = (app.data.calls || []).find((x) => x.num === p.call); if (c) selectCall(c.id); app.map?.focusUnit(p.id); } }, 'Locate'),
+        app.role === 'dispatcher' ? h('button', { class: 'btn', onclick: () => { const c = (app.data.calls || []).find((x) => x.num === p.call); if (c) C.assignDialog(c); } }, 'Send Backup') : null,
+        app.role === 'dispatcher' && !s100 ? h('button', { class: 'btn', onclick: () => act('toggleSignal100', { on: true, reason: `10-33 ${p.cs}` }, 'Signal 100 set.') }, 'Signal 100') : null)),
+      s100 ? h('div', { class: 'banner s100' }, h('span', { class: 'code' }, 'SIGNAL 100'),
+        h('span', { class: 'msg' }, `EMERGENCY TRAFFIC ONLY${s100.reason ? ` - ${up(s100.reason)}` : ''} - SET BY ${up(s100.by)} AT ${clock(s100.at)}`),
+        app.role === 'dispatcher' ? h('button', { class: 'btn', onclick: () => act('toggleSignal100', { on: false }, 'Signal 100 cleared.') }, 'Clear') : null) : null,
+    ]);
+
+    bind(status, (d) => [statusItems ? statusItems(d).map((x) => x.textContent + x.className) : [], d100(), d.ingame?.detected, d.ingame?.serverOk, d.ingame?.player?.postal], () => [
+      h('span', { class: 'grow' }, 'Ready'),
+      h('span', { title: 'CAD server connection' }, 'Connected'),
+      ingameStatus(),
+      statusItems ? statusItems(app.data) : null,
+      h('span', { class: d100() ? 'on' : '' }, `Signal 100 ${d100() ? 'ON' : 'off'}`),
+      h('span', { id: 'sb-clock', class: 'mono' }, ''),
+    ]);
+    return workspace;
+  }
+
+  // "In game: Postal 212 (ER:LC)" in the status bar, clickable to link Roblox.
+  function ingameStatus() {
+    const g = app.data.ingame || {};
+    let label;
+    let cls = '';
+    if (!g.serverOk) { label = 'ER:LC offline'; cls = 'warn'; }
+    else if (g.detected) label = g.player?.postal ? `Postal ${g.player.postal} (ER:LC)` : `In game as ${g.player?.name}`;
+    else { label = g.roblox ? `Not in game (${g.roblox.name})` : 'Not linked to ER:LC'; cls = 'warn'; }
+    return h('span', { class: `click ${cls}`, title: 'Your in-game link. Click to change your Roblox account.', onclick: robloxDialog }, label);
+  }
+
+  const fullScreen = () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.());
+  const fileMenu = (extra = []) => ['File', [
+    ...extra,
+    { label: 'Switch Console…', run: switchConsole },
+    { label: 'Full Screen', run: fullScreen },
+    '-',
+    { label: 'Sign Off', icon: 'signoff', run: signOff },
+  ]];
+  const toolsMenu = (extra = []) => ['Tools', [
+    ...extra,
+    { label: '10-Codes', icon: 'codes', run: () => C.tenCodesDialog() },
+    app.role === 'police' || app.role === 'law' || app.role === 'dispatcher' ? { label: 'Penal Codes', icon: 'penal', run: () => C.penalDialog() } : null,
+    { label: 'Notepad', icon: 'notepad', run: () => C.notepadDialog() },
+    { label: 'Timers', icon: 'timers', run: () => C.timersDialog() },
+    '-',
+    { label: 'Preferences…', icon: 'settings', run: prefsDialog },
+    { label: 'Link Roblox Account…', icon: 'link', run: robloxDialog },
+    app.role !== 'civilian' && app.role !== 'law' ? { label: 'Timecard…', icon: 'timecard', run: timecardDialog } : null,
+  ]];
+  const helpMenu = () => ['Help', [{ label: 'Command Reference', key: 'HELP', icon: 'help', run: commandHelp }, { label: 'About GSRP CAD', icon: 'info', run: aboutDialog }]];
+
+  // ---------- Command line ----------
+
+  function commandRow(hint) {
+    const input = h('input', { id: 'cmd', autocomplete: 'off', spellcheck: 'false', placeholder: 'Type a command, e.g. HELP' });
+    const past = [];
+    let hpos = 0;
+    const run = async () => {
+      const line = input.value.trim();
+      if (!line) return;
+      past.push(line);
+      hpos = past.length;
+      input.value = '';
+      await runCommand(line);
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); run(); }
+      if (e.key === 'ArrowUp' && past.length) { hpos = Math.max(0, hpos - 1); input.value = past[hpos]; e.preventDefault(); }
+      if (e.key === 'ArrowDown' && past.length) { hpos = Math.min(past.length, hpos + 1); input.value = past[hpos] || ''; e.preventDefault(); }
+    });
+    return h('div', { class: 'cmdrow' },
+      h('label', { for: 'cmd' }, 'Command:'), input, h('button', { class: 'btn', onclick: run }, 'Execute'),
+      h('span', { class: 'hint' }, hint));
+  }
+
+  const findCall = (n) => (app.data.calls || []).find((c) => String(c.num) === String(n || '').replace('#', ''));
+  const findUnit = (cs) => (app.data.units || []).find((u) => u.callsign.toUpperCase() === String(cs || '').toUpperCase());
+  function parseStatus(word) {
+    let w = String(word || '').toUpperCase();
+    if (/^\d+$/.test(w)) w = `10-${w}`;
+    for (const [key, s] of Object.entries(STATUS)) {
+      if (key === 'panic') continue;
+      if (w === s.code || w === s.short || w === key.toUpperCase()) return key;
+    }
+    return null;
+  }
+
+  async function runCommand(line) {
+    const [verbRaw, ...args] = line.split(/\s+/);
+    const verb = verbRaw.toUpperCase();
+    const rest = line.slice(verbRaw.length).trim();
+    const dispatch = app.role === 'dispatcher';
+    const bad = (msg) => toast(msg, 'error');
+    switch (verb) {
+      case 'HELP': case '?': return commandHelp();
+      case 'DP': {
+        if (!dispatch) return bad('DP is a dispatcher command.');
+        // Accept DP <call#> <units...> or DP <unit> <call#>.
+        let callArg = args[0];
+        let units = args.slice(1);
+        if (!findCall(callArg) && args.length === 2 && findCall(args[1])) [callArg, units] = [args[1], [args[0]]];
+        const call = findCall(callArg);
+        if (!call) return bad(`No call #${callArg || ''}. Usage: DP <call#> <unit>`);
+        for (const cs of units) {
+          const u = findUnit(cs);
+          if (!u) bad(`No unit ${cs} logged on.`);
+          else await act('attach', { id: call.id, userId: u.userId }, `${u.callsign} dispatched to #${call.num}.`);
+        }
+        return selectCall(call.id);
+      }
+      case 'ST': {
+        if (dispatch) {
+          const u = findUnit(args[0]);
+          const s = parseStatus(args[1]);
+          if (!u || !s) return bad('Usage: ST <unit> <10-code>, e.g. ST 2041 10-8');
+          return act('setStatus', { userId: u.userId, status: s }, `${u.callsign} ${statusText(s)}.`);
+        }
+        const s = parseStatus(args[0]);
+        if (!s) return bad('Usage: ST <10-code>, e.g. ST 10-97');
+        return act('setStatus', { status: s }, `Status ${statusText(s)}.`);
+      }
+      case 'NC': {
+        const [title, loc] = rest.split('/').map((x) => x.trim());
+        const code = CALL_CODES.find(([c]) => c === (title || '').split(' ')[0]);
+        return C.newCallDialog(null, { code: code?.[0], nature: code ? code[1] : title, location: loc, priority: code?.[3], depts: code?.[2] });
+      }
+      case 'GC': case 'CALL': return C.getCallDialog(args[0]);
+      case 'CL': {
+        const call = findCall(args[0]);
+        if (!call) return bad(`No call #${args[0] || ''}.`);
+        return act('closeCall', { id: call.id, disposition: args.slice(1).join(' ') }, `Call #${call.num} closed.`);
+      }
+      case 'NT': {
+        const call = findCall(args[0]);
+        if (!call || args.length < 2) return bad('Usage: NT <call#> <note>');
+        return act('addNote', { id: call.id, text: args.slice(1).join(' ') }, 'Note added.');
+      }
+      case 'AT': case 'DT': {
+        if (dispatch) return bad('Use DP to dispatch units.');
+        const call = findCall(args[0]) || (verb === 'AT' ? C.selectedCallObj() : C.myOpenCall());
+        if (!call) return bad('No call found.');
+        return act(verb === 'AT' ? 'attach' : 'detach', { id: call.id }, verb === 'AT' ? `Attached to #${call.num}.` : `Detached from #${call.num}.`);
+      }
+      case 'LU': return C.openLookup('name', rest);
+      case 'PL': case 'RP': return C.openLookup('plate', rest);
+      case 'SN': return C.openLookup('serial', rest);
+      case 'BOLO': return C.bolosDialog();
+      case 'MSG': {
+        const target = args[0];
+        const body = args.slice(1).join(' ');
+        if (!target || !body) return bad('Usage: MSG <unit|ALL|DISPATCH> <text>');
+        const to = target.toUpperCase() === 'ALL' ? 'all' : target.toUpperCase() === 'DISPATCH' ? 'dispatch' : findUnit(target)?.userId;
+        if (!to) return bad(`No unit ${target} logged on.`);
+        return act('sendMessage', { to, text: body }, 'Message sent.');
+      }
+      case 'S100': {
+        if (!dispatch) return bad('Signal 100 is set by dispatch.');
+        const word = (args[0] || '').toUpperCase();
+        const on = word === 'ON' ? true : word === 'OFF' ? false : !d100();
+        const reason = (word === 'ON' || word === 'OFF' ? args.slice(1) : args).join(' ');
+        return act('toggleSignal100', { on, reason: on ? reason : '' }, on ? 'Signal 100 set.' : 'Signal 100 cleared.');
+      }
+      case 'ACK': return dispatch ? act('ackPanic', {}, 'Panic acknowledged.') : bad('ACK is a dispatcher command.');
+      case 'LOC': {
+        if (dispatch) return bad('LOC is a unit command.');
+        const [loc, postal] = rest.split('/').map((x) => x.trim());
+        return act('setLocation', { location: loc, postal: postal || '' }, 'Location updated.');
+      }
+      default: return bad(`Unknown command "${verb}". Type HELP for the list.`);
+    }
+  }
+
+  function commandHelp() {
+    const rows = [
+      ['DP <call#> <unit...>', 'Dispatch units to a call (dispatch)'],
+      ['ST <unit> <10-code>', 'Set a unit status, e.g. ST 2041 10-8 (dispatch)'],
+      ['ST <10-code>', 'Set your own status (units)'],
+      ['AT [call#] / DT', 'Attach to or detach from a call (units)'],
+      ['NC <10-code|title> / <address>', 'New call, e.g. NC 10-50 / Highway 55'],
+      ['GC <call#>', 'Get a call by number, open or closed'],
+      ['NT <call#> <text>', 'Add a note to a call'],
+      ['CL <call#> [disposition]', 'Close a call'],
+      ['LU <name>', 'Name lookup'],
+      ['PL <plate>', 'Plate lookup'],
+      ['SN <serial>', 'Weapon serial lookup'],
+      ['MSG <unit|ALL|DISPATCH> <text>', 'Send a message'],
+      ['BOLO', 'Open BOLOs'],
+      ['S100 [ON|OFF] [reason]', 'Signal 100, emergency traffic only (dispatch)'],
+      ['ACK', 'Acknowledge panic (dispatch)'],
+      ['LOC <location> / <postal>', 'Set your location by hand (units)'],
+    ];
+    openDialog({ id: 'help', title: 'Command Reference', width: 600, icon: 'help', content: h('div', null,
+      h('div', { class: 'ref-table' }, grid([{ label: 'Command', render: (r) => r[0] }, { label: 'Description', render: (r) => r[1] }], rows, { key: (r) => r[0] })),
+      h('p', { style: 'margin-top:8px' }, 'Shortcuts: F2 New Call · F3 Answer 911 · F4 Get Call · F5 Dispatch · F7 Lookup · F8 BOLO · F9 Map · F12 Panic Ack. Up and Down arrows recall past commands.')) });
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (!app.role || app.role === 'civilian') return;
+    if (app.role === 'law') {
+      if (e.key === 'F7') { e.preventDefault(); C.openLookup(); }
+      return;
+    }
+    const keys = {
+      F2: () => C.newCallDialog(),
+      F3: () => { if (app.role === 'dispatcher') C.answerFirstLine?.(); },
+      F4: () => C.getCallDialog(),
+      F5: () => { const c = C.selectedCallObj(); if (c && app.role === 'dispatcher') C.assignDialog(c); },
+      F7: () => C.openLookup(),
+      F8: () => C.bolosDialog(),
+      F9: () => app.map?.fit(),
+      F12: () => { if (app.role === 'dispatcher') act('ackPanic', {}, 'Panic acknowledged.'); },
+    };
+    if (keys[e.key]) { e.preventDefault(); keys[e.key](); }
+  });
+
+  // ---------- Account and preference dialogs ----------
+
+  function robloxDialog() {
+    const g = app.data?.ingame || {};
+    const linked = g.roblox;
+    return formDialog({
+      title: 'Link Roblox Account',
+      submitLabel: 'Save',
+      icon: 'link',
+      width: 470,
+      intro: g.detected
+        ? `You are in the ER:LC server as ${g.player.name}${g.player.team ? ` (${g.player.team})` : ''}. Your location and vehicles update by themselves.`
+        : linked
+          ? `Linked to ${linked.name}${linked.source === 'typed' ? '' : linked.source === 'melonly' ? ' (from your Melonly verification)' : ' (detected automatically)'}. You are not in the ER:LC server right now.`
+          : 'The CAD finds your Roblox account from your Melonly verification, the same as tickets. If it does not, type your Roblox username here. Leave it blank to go back to Melonly.',
+      fields: [
+        { name: 'name', label: 'Roblox username', value: linked?.name || '', max: 20, placeholder: 'Your Roblox username', wide: true },
+      ],
+      onSubmit: (v) => act('setRoblox', { name: v.name }, v.name ? `Linked to ${v.name}.` : 'Roblox link removed.'),
+    });
+  }
+
+  function prefsDialog() {
+    const p = prefs();
+    const unit = UNIT_ROLES.includes(app.role);
+    const voiceTest = h('button', { class: 'btn btn-small', type: 'button', onclick: () => speak('Unit twenty forty one, respond to ten fifty, vehicle crash, postal two twelve.', true) }, 'Test voice');
+    return formDialog({
+      title: 'Preferences',
+      submitLabel: 'Save',
+      icon: 'settings',
+      width: 520,
+      fields: [
+        { type: 'html', el: h('b', null, 'Layout') },
+        unit ? { name: 'mdtLayout', label: 'MDT layout', type: 'select', value: p.mdtLayout, options: [['tabbed', 'Tabbed MDT (My Call, Calls, Lookup…)'], ['board', 'Board (calls, units, viewer and map)']] } : null,
+        app.role === 'dispatcher' ? { name: 'dispatchLayout', label: 'Console layout', type: 'select', value: p.dispatchLayout, options: [['standard', 'Standard'], ['map', 'Large map'], ['nomap', 'No map (more room for calls)']] } : null,
+        { name: 'fontSize', label: 'Text size', type: 'select', value: p.fontSize, options: [['normal', 'Normal'], ['large', 'Large']] },
+        { name: 'clock24', label: '24 hour clock', type: 'checkbox', value: p.clock24 },
+        { type: 'html', el: h('b', null, 'Alerts') },
+        { name: 'tts', label: 'Read dispatches and urgent traffic out loud (text to speech)', type: 'checkbox', value: p.tts, wide: true },
+        { name: 'ttsRate', label: 'Voice speed', type: 'select', value: p.ttsRate, options: [[0.85, 'Slow'], [1.05, 'Normal'], [1.3, 'Fast']] },
+        { type: 'html', el: voiceTest },
+        { name: 'tones', label: 'Alert tones', type: 'checkbox', value: p.tones },
+        unit ? { name: 'autoOpenCall', label: 'Open the call when dispatch assigns me', type: 'checkbox', value: p.autoOpenCall, wide: true } : null,
+        { type: 'html', el: h('b', null, 'Map') },
+        { name: 'mapStyle', label: 'Map', type: 'select', value: p.mapStyle, options: [['fall', 'Fall (default)'], ['snow', 'Winter'], ['spring', 'Spring'], ['summer', 'Summer']] },
+        { name: 'mapPostals', label: 'Show postal numbers', type: 'checkbox', value: p.mapPostals },
+        app.role !== 'civilian' ? { name: 'hidePlayers', label: 'Hide in-game players who are not units', type: 'checkbox', value: p.hidePlayers } : null,
+        UNIT_ROLES.includes(app.role) ? { name: 'autoRoute', label: 'Show directions to my call automatically', type: 'checkbox', value: p.autoRoute !== false } : null,
+      ],
+      onSubmit: async (v) => {
+        const next = {};
+        for (const [k, val] of Object.entries(v)) next[k] = k === 'ttsRate' ? Number(val) : val;
+        const layoutChanged = (next.mdtLayout && next.mdtLayout !== p.mdtLayout) || (next.dispatchLayout && next.dispatchLayout !== p.dispatchLayout);
+        await setPrefs(next);
+        toast('Preferences saved.', 'ok');
+        if (layoutChanged) renderConsole();
+        else app.map?.reload?.();
+        return true;
+      },
+    });
+  }
+
+  function timecardDialog() {
+    return liveDialog({ id: 'timecard', title: 'Timecard', width: 620, icon: 'timecard' }, (d) => [d.shifts, d.myUnit?.callsign, d.myDispatch?.callsign], () => {
+      const shifts = app.data.shifts || [];
+      const weekAgo = Date.now() - 7 * 864e5;
+      const total = shifts.filter((s) => s.start > weekAgo).reduce((sum, s) => sum + ((s.end || Date.now()) - s.start), 0);
+      const onDuty = app.data.myUnit || app.data.myDispatch;
+      return [
+        h('div', { style: 'display:flex;gap:10px;align-items:center;margin-bottom:8px' },
+          icon(onDuty ? 'clockin' : 'power', 32),
+          h('div', { style: 'flex:1' }, h('b', null, onDuty ? `Clocked in as ${onDuty.callsign}` : 'Clocked out'), h('br'), `This week: ${duration(total)}`),
+          onDuty
+            ? h('button', { class: 'btn', onclick: () => (app.data.myUnit ? act('goOffDuty', {}, 'Clocked out (10-42).') : act('dispatchLogOff', {}, 'Clocked out.')) }, 'Clock Out')
+            : h('button', { class: 'btn btn-default', onclick: () => (app.role === 'dispatcher' ? C.dispatchLogOnDialog?.() : C.logOnDialog?.()) }, 'Clock In')),
+        h('div', { class: 'ref-table' }, grid([
+          { label: 'Date', render: (s) => date(s.start) },
+          { label: 'Dept', render: (s) => up(ROLES[s.dept]?.label || s.dept) },
+          { label: 'Callsign', render: (s) => s.callsign },
+          { label: 'In', render: (s) => clock(s.start) },
+          { label: 'Out', render: (s) => (s.end ? clock(s.end) : 'ON DUTY'), cls: (s) => (s.end ? '' : 'tx-available') },
+          { label: 'Length', render: (s) => duration((s.end || Date.now()) - s.start) },
+          { label: 'Note', render: (s) => (s.reason ? 'AUTO LOG OFF' : '') },
+        ], shifts, { empty: 'No shifts yet.' })),
+      ];
+    });
+  }
+
+  function aboutDialog() {
+    openDialog({ id: 'about', title: 'About GSRP CAD', width: 380, icon: 'info', content: h('div', { style: 'display:flex;gap:12px;align-items:center' },
+      h('img', { src: LOGO, alt: '', style: 'width:56px;height:56px;background:#0a246a;padding:4px' }),
+      h('div', null, h('b', null, 'GSRP Roleplay CAD'), h('br'), 'Georgia State Roleplay', h('br'), 'Web console at gsrp.lol/cad', h('br'), 'Map and positions from ER:LC.')) });
+  }
+
+  // ---------- Consoles ----------
+
+  function renderConsole() {
+    app.updaters = [];
+    app.map = null;
+    app.lookup = null;
+    C.onLookupFocus = null;
+    closeAllDialogs();
+    const render = C.consoles[app.role];
+    if (render) render();
+    else $app.replaceChildren(h('p', null, 'This console failed to load. Reload the page.'));
+  }
+
+  const selectedCallObj = () => (app.data.calls || []).find((c) => c.id === app.selectedCall) || null;
+  const myOpenCall = () => (app.data.calls || []).find((c) => isOpen(c) && c.units.some((u) => u.userId === app.me.user.id)) || null;
+  function selectCall(id) {
+    app.selectedCall = id;
+    refreshNow();
+  }
+
+  Object.assign(C, {
+    app, LOGO, ROLES, UNIT_ROLES, AGENCIES, RANKS, STATUS, STATUS_ORDER, SETTABLE, STATUS_COLOR, CALL_CODES, RADIO_CODES, PENAL, CLASS_NAME, SOURCE,
+    LICENSE_NAMES, LICENSE_KINDS, PRIORITY_NAME, ICONS, GLYPH,
+    icon, roleIcon, h, wait, pad, clock, date, stamp, age, duration, money, since, flag, up, store, agencyShort, statusText, statusCode, callTitle, isOpen, cap,
+    licClass, txClass, toast, tone, TONES, speak, prefs, setPrefs, api, act, openDialog, closeAllDialogs, formDialog, confirmDialog, liveDialog,
+    grid, tabStrip, group, frow, roField, bind, child, menubar, tool, sep, d100, shell, fileMenu, toolsMenu, helpMenu, runCommand, commandHelp,
+    findCall, findUnit, robloxDialog, prefsDialog, timecardDialog, aboutDialog, renderConsole, selectedCallObj, myOpenCall, selectCall,
+    refresh, refreshNow, switchConsole, signOff, fullScreen,
+  });
+
+  document.addEventListener('DOMContentLoaded', boot);
+})();

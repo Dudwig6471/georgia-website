@@ -1,0 +1,1810 @@
+// GSRP CAD shared windows: calls, units, 911 lines, the call viewer, the
+// live ER:LC map, lookups, records and the tool dialogs every console uses.
+(() => {
+  'use strict';
+
+  const C = window.CAD;
+  const {
+    app, ROLES, UNIT_ROLES, AGENCIES, RANKS, STATUS, STATUS_ORDER, SETTABLE, STATUS_COLOR, CALL_CODES, RADIO_CODES, PENAL, CLASS_NAME, SOURCE,
+    LICENSE_NAMES, LICENSE_KINDS, PRIORITY_NAME,
+    icon, h, pad, clock, date, stamp, age, money, since, flag, up, store, agencyShort, statusText, callTitle, isOpen, cap,
+    licClass, txClass, toast, tone, TONES, prefs, api, act, openDialog, formDialog, confirmDialog, liveDialog,
+    grid, tabStrip, group, frow, roField, bind, child, selectCall, selectedCallObj, refreshNow,
+  } = C;
+
+  const me = () => app.me.user.id;
+  const isDispatch = () => app.role === 'dispatcher';
+  const btn = (label, run, cls = '', title) => h('button', { class: `btn btn-small ${cls}`, onclick: run, title, type: 'button' }, label);
+  const need = (fn) => () => { const c = selectedCallObj(); if (!c) return toast('Select a call first.', 'error'); return fn(c); };
+  const callCode = (c) => c.code || '';
+  const onCall = (userId, d = app.data) => (d.calls || []).find((c) => isOpen(c) && c.units.some((u) => u.userId === userId)) || null;
+  const plateFmt = (v) => [v.year, v.color, v.make, v.model].filter(Boolean).join(' ');
+
+  // ---------- Calls window ----------
+
+  const myCalls = (d) => (d.calls || []).filter((c) => isDispatch() || c.depts.includes(app.role) || c.units.some((u) => u.userId === me()));
+
+  function visibleCalls(d) {
+    const f = app.callFilter;
+    const calls = myCalls(d).filter((c) => (f === 'open' ? isOpen(c) : f === 'pending' ? c.status === 'pending' : f === 'active' ? c.status === 'active' : f === 'closed' ? !isOpen(c) : true));
+    const sorters = {
+      priority: (a, b) => (isOpen(b) - isOpen(a)) || a.priority - b.priority || a.at - b.at,
+      age: (a, b) => a.at - b.at,
+      id: (a, b) => b.num - a.num,
+    };
+    return [...calls].sort(sorters[app.callSort] || sorters.priority);
+  }
+
+  // Drag a unit row onto a call row to dispatch it.
+  const UNIT_MIME = 'text/x-gsrp-unit';
+  function dropTarget(call) {
+    if (!isDispatch() || !isOpen(call)) return {};
+    return {
+      ondragover: (e) => { if ([...e.dataTransfer.types].includes(UNIT_MIME)) { e.preventDefault(); e.currentTarget.classList.add('drop'); } },
+      ondragleave: (e) => e.currentTarget.classList.remove('drop'),
+      ondrop: (e) => {
+        e.preventDefault();
+        e.currentTarget.classList.remove('drop');
+        const userId = e.dataTransfer.getData(UNIT_MIME);
+        const u = (app.data.units || []).find((x) => x.userId === userId);
+        if (u) act('attach', { id: call.id, userId }, `${u.callsign} dispatched to #${call.num}.`);
+      },
+    };
+  }
+  const dragSource = (u) => (isDispatch() ? {
+    draggable: 'true',
+    ondragstart: (e) => { e.dataTransfer.setData(UNIT_MIME, u.userId); e.dataTransfer.setData('text/plain', u.callsign); e.dataTransfer.effectAllowed = 'link'; document.body.classList.add('dragging-unit'); },
+    ondragend: () => document.body.classList.remove('dragging-unit'),
+  } : {});
+
+  function callsWindow(cls, { title = 'Active Calls' } = {}) {
+    const dispatch = isDispatch();
+    const show = h('select', { onchange: (e) => { app.callFilter = e.target.value; refreshNow(); } },
+      [['open', 'All Open'], ['pending', 'Pending'], ['active', 'Active'], ['closed', 'History'], ['all', 'Everything']].map(([v, l]) => h('option', { value: v, selected: app.callFilter === v }, l)));
+    const sort = h('select', { onchange: (e) => { app.callSort = e.target.value; refreshNow(); } },
+      [['priority', 'Priority'], ['age', 'Age'], ['id', 'Number']].map(([v, l]) => h('option', { value: v, selected: app.callSort === v }, l)));
+    const counts = h('span', { class: 'counters plain' });
+    const tools = dispatch
+      ? [btn('New', () => newCallDialog()), btn('Edit', need((c) => newCallDialog(c))), btn('Assign', need(assignDialog)), btn('Detach', need(detachDialog)), btn('Close', need(closeCallDialog)), btn('Get Call', () => getCallDialog())]
+      : [btn('Attach', need((c) => act('attach', { id: c.id }, `Attached to #${c.num}.`))), btn('Detach', need((c) => act('detach', { id: c.id }, `Detached from #${c.num}.`))), btn('Note', need(noteDialog)), btn('Close', need(closeCallDialog))];
+    tools.push(h('span', { class: 'sep' }), h('label', null, 'Show:', show), h('label', null, 'Sort:', sort), counts);
+    const w = child(title, { cls, tools, ic: 'viewer' });
+    bind(w.body, (d) => ({ calls: visibleCalls(d), sel: app.selectedCall, f: app.callFilter, s: app.callSort }), ({ calls }, d) => {
+      const all = myCalls(d);
+      const open = all.filter(isOpen);
+      const pending = open.filter((c) => c.status === 'pending').length;
+      w.setTitle(`${title} - ${open.length} Open (${pending} Pending)`);
+      counts.textContent = `Pending ${pending} · Active ${open.length - pending} · Closed ${all.length - open.length}`;
+      return grid([
+        { label: 'ID', render: (c) => String(c.num) },
+        { label: 'Pri', render: (c) => `P${c.priority}`, cls: () => 'pri' },
+        { label: 'Code', render: (c) => callCode(c) },
+        { label: 'Call Title', render: (c) => up(callTitle(c)) },
+        { label: 'Address', render: (c) => up(c.location) },
+        { label: 'Postal', render: (c) => c.postal || '' },
+        { label: 'Units', render: (c) => (c.units.length ? c.units.map((u) => u.callsign).join(' ') : '-- NONE --') },
+        { label: 'Src', render: (c) => SOURCE[c.source] || 'DISPATCH' },
+        { label: 'Status', render: (c) => up(c.status), cls: (c) => `cell st-${c.status}` },
+        { label: 'Age', render: (c) => (isOpen(c) ? since(c.at) : clock(c.closedAt)) },
+      ], calls, {
+        selected: app.selectedCall,
+        onSelect: (c) => selectCall(c.id),
+        onOpen: (c) => (dispatch ? newCallDialog(c) : selectCall(c.id)),
+        rowClass: (c) => `p${c.priority} ${c.status} ${c.units.some((u) => u.userId === me()) ? 'mine' : ''}`,
+        rowAttrs: dropTarget,
+        empty: dispatch ? 'No calls. Press F2 for a new call.' : 'No calls for your department.',
+      });
+    });
+    return w.el;
+  }
+
+  // ---------- Units window ----------
+
+  function setSelectedUnit(status) {
+    const u = (app.data.units || []).find((x) => x.userId === app.selectedUnit);
+    if (!u) return toast('Select a unit first.', 'error');
+    return act('setStatus', { userId: u.userId, status }, `${u.callsign} ${statusText(status)}.`);
+  }
+
+  function unitsWindow(cls) {
+    const dispatch = isDispatch();
+    const dept = h('select', { onchange: (e) => { app.deptFilter = e.target.value; refreshNow(); } },
+      [['all', 'All Departments'], ['police', 'Police'], ['fire', 'Fire / EMS'], ['dot', 'DOT']].map(([v, l]) => h('option', { value: v, selected: app.deptFilter === v }, l)));
+    const counters = h('span', { class: 'counters' });
+    const statusBtns = dispatch ? ['available', 'enroute', 'onscene', 'busy', 'transport', 'unavailable'].map((s) => h('button', {
+      class: 'btn btn-small st-btn', style: `--st:${STATUS_COLOR[s]}`, title: `Set the selected unit ${STATUS[s].label}`, onclick: () => setSelectedUnit(s),
+    }, STATUS[s].code)) : [];
+    const w = child('Active Units', { cls, ic: 'units', tools: [statusBtns, dispatch ? btn('Locate', () => app.selectedUnit && app.map?.focusUnit(app.selectedUnit)) : null, h('span', { class: 'sep' }), h('label', null, 'Dept:', dept), counters] });
+    bind(w.body, (d) => ({
+      units: (d.units || []).filter((u) => app.deptFilter === 'all' || u.dept === app.deptFilter),
+      calls: (d.calls || []).filter(isOpen).map((c) => ({ num: c.num, units: c.units.map((u) => u.userId) })),
+      sel: app.selectedUnit,
+    }), ({ units, calls }, d) => {
+      const all = d.units || [];
+      w.setTitle(`Active Units - ${all.length} Logged On${dispatch ? ' (drag a unit onto a call to assign)' : ''}`);
+      counters.replaceChildren(...STATUS_ORDER.map((s) => h('span', { style: `background:${STATUS_COLOR[s]};${['onscene', 'panic', 'transport'].includes(s) ? 'color:#fff' : ''}`, title: STATUS[s].label }, `${STATUS[s].code}:${all.filter((u) => u.status === s).length}`)));
+      const groupName = (u) => up(u.agency || ROLES[u.dept].label);
+      const sorted = [...units].sort((a, b) => groupName(a).localeCompare(groupName(b)) || a.callsign.localeCompare(b.callsign, undefined, { numeric: true }));
+      const counts = {};
+      for (const u of sorted) counts[groupName(u)] = (counts[groupName(u)] || 0) + 1;
+      return grid([
+        { label: 'Unit', render: (u) => u.callsign, cls: (u) => `tx-${u.status}` },
+        { label: 'Name', render: (u) => up(u.name) },
+        { label: 'Dept', render: (u) => agencyShort(u) },
+        { label: 'Rank/Type', render: (u) => up([u.rank, u.apparatus].filter(Boolean).join(' ')) },
+        { label: 'Location', render: (u) => `${u.postal ? `${u.postal} ` : ''}${up(u.location)}` },
+        { label: 'Call', render: (u) => String(calls.find((c) => c.units.includes(u.userId))?.num || '--') },
+        { label: 'Status', render: (u) => statusText(u.status), cls: (u) => `cell st-${u.status}` },
+        { label: 'Time', render: (u) => since(u.at) },
+        { label: 'Game', render: (u) => (u.lastInGame && Date.now() - u.lastInGame < 60000 ? 'IN' : '--'), cls: (u) => (u.lastInGame && Date.now() - u.lastInGame < 60000 ? 'tx-available' : 'tx-unavailable') },
+      ], sorted, {
+        key: (u) => u.userId,
+        selected: app.selectedUnit,
+        onSelect: (u) => { app.selectedUnit = u.userId; refreshNow(); },
+        onOpen: (u) => app.map?.focusUnit(u.userId),
+        rowAttrs: dragSource,
+        rowClass: (u) => (u.userId === me() ? 'mine' : ''),
+        groupBy: (u) => `${groupName(u)} - ${counts[groupName(u)]}`,
+        empty: 'No units logged on.',
+      });
+    });
+    return w.el;
+  }
+
+  // ---------- 911 lines ----------
+
+  // Calls that came in from callers and have not been worked yet.
+  const emergencyLines = (d) => (d.calls || []).filter((c) => isOpen(c) && !c.imported && ['911', 'ingame', '311'].includes(c.source)).sort((a, b) => (a.source === '311') - (b.source === '311') || a.at - b.at);
+  const lineState = (c) => (c.hold ? 'HOLD' : c.answeredAt ? 'ANSWERED' : 'RINGING');
+
+  function answerCall(c) {
+    selectCall(c.id);
+    return act('answerCall', { id: c.id });
+  }
+  function answerFirstLine() {
+    const first = emergencyLines(app.data).find((c) => !c.answeredAt) || emergencyLines(app.data)[0];
+    if (!first) return toast('No 911 lines ringing.', 'error');
+    return answerCall(first);
+  }
+  // Import: the line becomes a worked call (moves off the 911 board).
+  function importCall(c) {
+    return newCallDialog(c, { importing: true });
+  }
+
+  function emergencyWindow(cls) {
+    const pick = () => emergencyLines(app.data).find((c) => c.id === app.selectedCall) || emergencyLines(app.data)[0];
+    const needLine = (fn) => () => { const c = pick(); if (!c) return toast('No 911 line selected.', 'error'); return fn(c); };
+    const w = child('Emergency Lines (911 / 311)', { cls, ic: 'phone911', tools: [
+      btn('Answer', needLine(answerCall), '', 'Answer (F3)'),
+      btn('Hold', needLine((c) => act('holdCall', { id: c.id }))),
+      btn('Import', needLine(importCall), '', 'Make it a call and dispatch units'),
+      btn('Merge', needLine(mergeDialog)),
+      btn('Text', needLine(textCallerDialog), '', 'Text the caller'),
+      btn('Drop', needLine((c) => act('closeCall', { id: c.id, disposition: 'Dropped / no answer' }, `#${c.num} dropped.`)), 'btn-danger'),
+    ] });
+    bind(w.body, (d) => ({ lines: emergencyLines(d).map((c) => [c.id, c.hold, c.answeredAt, c.notes.length]), sel: app.selectedCall }), () => {
+      const lines = emergencyLines(app.data);
+      w.setTitle(`Emergency Lines (911 / 311) - ${lines.length} Line${lines.length === 1 ? '' : 's'}`);
+      const rows = lines.map((c, i) => ({ ...c, line: i + 1 }));
+      while (rows.length < 4) rows.push({ id: `idle${rows.length}`, idle: true, line: rows.length + 1 });
+      return grid([
+        { label: 'Line', render: (c) => `L${c.line}`, cls: (c) => (c.idle ? '' : `cell ${c.source === '311' ? 'st-enroute' : c.answeredAt && !c.hold ? 'st-available' : 'st-onscene'}`) },
+        { label: 'State', render: (c) => (c.idle ? 'IDLE' : lineState(c)), cls: (c) => (c.idle ? 'tx-unavailable' : c.hold ? 'tx-busy' : c.answeredAt ? 'tx-available' : 'tx-panic blink') },
+        { label: 'Type', render: (c) => (c.idle ? '' : SOURCE[c.source]) },
+        { label: 'Caller', render: (c) => (c.idle ? '' : up(c.caller || 'UNKNOWN')) },
+        { label: 'Callback', render: (c) => c.callback || '' },
+        { label: 'Location', render: (c) => (c.idle ? '' : `${c.postal ? `${c.postal} · ` : ''}${up(c.location)}`) },
+        { label: 'Description', render: (c) => (c.idle ? '' : up(c.details || callTitle(c))) },
+        { label: 'Wait', render: (c) => (c.idle ? '' : since(c.at)) },
+      ], rows, {
+        selected: app.selectedCall,
+        onSelect: (c) => !c.idle && selectCall(c.id),
+        onOpen: (c) => !c.idle && answerCall(c),
+        rowClass: (c) => (c.idle ? 'idle' : ''),
+        empty: 'No lines.',
+      });
+    });
+    return w.el;
+  }
+
+  function mergeDialog(c) {
+    const targets = (app.data.calls || []).filter((x) => isOpen(x) && x.id !== c.id);
+    if (!targets.length) return toast('No other open calls to merge into.', 'error');
+    return formDialog({
+      title: `Merge #${c.num} into another call`,
+      submitLabel: 'Merge',
+      icon: 'viewer',
+      fields: [{ name: 'into', label: 'Merge into', type: 'select', wide: true, options: targets.map((t) => [t.id, `#${t.num} ${callCode(t)} ${callTitle(t)} - ${t.location || ''}`]) }],
+      onSubmit: async (v) => {
+        const into = targets.find((t) => t.id === v.into);
+        const ok = await act('addNote', { id: into.id, text: `Merged #${c.num} (${c.caller || 'caller'}): ${c.details || callTitle(c)}` });
+        if (!ok) return false;
+        await act('closeCall', { id: c.id, disposition: `Merged into #${into.num}` }, `#${c.num} merged into #${into.num}.`);
+        selectCall(into.id);
+        return true;
+      },
+    });
+  }
+
+  function textCallerDialog(c) {
+    if (!c.callerUserId) return toast('This caller called from in game and cannot get texts. Use the in-game radio.', 'error');
+    return formDialog({
+      title: `Text Caller - #${c.num} ${c.caller || ''}`,
+      submitLabel: 'Send Text',
+      icon: 'messages',
+      fields: [{ name: 'text', label: 'Message', type: 'textarea', required: true, max: 500, rows: 3 }],
+      onSubmit: (v) => act('textCaller', { id: c.id, text: v.text }, 'Text sent to the caller.'),
+    });
+  }
+
+  // ---------- Suggested units ----------
+
+  function callPos(c) {
+    if (Number.isFinite(c?.x) && Number.isFinite(c?.z)) return { x: c.x, z: c.z };
+    const p = c?.postal && app.data.postals?.[c.postal];
+    return p ? { x: p.x, z: p.z } : null;
+  }
+  // The five closest units of the call's departments that are not on a call.
+  function suggestedUnits(c, n = 5) {
+    if (!c) return [];
+    const pos = callPos(c);
+    const free = (app.data.units || []).filter((u) => c.depts.includes(u.dept) && !onCall(u.userId) && !['unavailable', 'panic'].includes(u.status));
+    const dist = (u) => (pos && Number.isFinite(u.x) && Number.isFinite(u.z) ? Math.hypot(u.x - pos.x, u.z - pos.z) : Infinity);
+    return free.map((u) => ({ u, d: dist(u) })).sort((a, b) => a.d - b.d || (a.u.status === 'available' ? -1 : 1)).slice(0, n);
+  }
+  const distLabel = (d) => (Number.isFinite(d) ? (d >= 1000 ? `${(d / 1000).toFixed(1)}k` : String(Math.round(d))) : '--');
+
+  function suggestedBox(c) {
+    const list = suggestedUnits(c);
+    return h('div', { class: 'suggest' },
+      h('div', { class: 'suggest-head' }, icon('units', 16), h('b', null, 'Suggested Units'), h('small', null, 'closest, not on a call')),
+      list.length ? list.map(({ u, d }, i) => h('div', { class: 'suggest-row' },
+        h('span', { class: 'rank' }, String(i + 1)),
+        h('span', { class: `cs tx-${u.status}` }, u.callsign),
+        h('span', { class: 'nm' }, `${agencyShort(u)} ${up(u.rank || '')}`),
+        h('span', { class: 'dist', title: 'Distance in studs' }, distLabel(d)),
+        h('button', { class: 'btn btn-small', type: 'button', onclick: () => act('attach', { id: c.id, userId: u.userId }, `${u.callsign} dispatched to #${c.num}.`) }, 'Assign'))) : h('div', { class: 'empty' }, `No free ${c.depts.map((x) => ROLES[x].label).join(' / ')} units.`),
+      list.length > 1 ? h('div', { class: 'btnrow left' }, h('button', { class: 'btn btn-small', type: 'button', onclick: async () => { for (const { u } of list.slice(0, 2)) await act('attach', { id: c.id, userId: u.userId }); toast(`Two closest units dispatched to #${c.num}.`, 'ok'); } }, 'Assign 2 Closest')) : null);
+  }
+
+  // ---------- Call viewer ----------
+
+  function viewerWindow(cls) {
+    const dispatch = isDispatch();
+    const w = child('Call Viewer', { cls, bodyClass: 'face', ic: 'viewer' });
+    w.body.classList.add('viewer-body');
+    let shownId = null;
+    let tab = 'general';
+    let refs = {};
+
+    const current = () => (dispatch ? selectedCallObj() : selectedCallObj() || C.myOpenCall());
+
+    function build(c) {
+      shownId = c?.id || null;
+      refs = {};
+      if (!c) {
+        w.setTitle('Call Viewer');
+        w.body.replaceChildren(h('div', { class: 'empty big' }, icon('viewer', 32), dispatch ? 'Select a call or answer a 911 line to view it here.' : 'Select a call, or attach to one, to view it here.'));
+        return;
+      }
+      const ro = !dispatch;
+      const field = (name, value, opts = {}) => {
+        const el = opts.options
+          ? h('select', { disabled: ro }, opts.options.map(([v, l]) => h('option', { value: v, selected: String(value) === String(v) }, l)))
+          : h('input', { value: value ?? '', readonly: ro || opts.readonly, maxlength: opts.max || 120 });
+        refs[name] = el;
+        return el;
+      };
+      const row = (label, el) => frow(`${label}:`, el);
+      const codeOptions = [['', '--'], ...CALL_CODES.map(([code, t]) => [code, `${code} ${t}`])];
+      if (c.code && !CALL_CODES.some(([code]) => code === c.code)) codeOptions.push([c.code, c.code]);
+      refs.unitsBox = h('div', { class: 'mini-grid' });
+      refs.notesBox = h('div', { class: 'notes-list' });
+      refs.suggest = h('div');
+      refs.details = h('textarea', { rows: 3, readonly: ro, maxlength: 1000, style: 'width:100%' });
+      refs.details.value = c.details || '';
+      const deptBoxes = UNIT_ROLES.map((d) => {
+        const cb = h('input', { type: 'checkbox', checked: c.depts.includes(d), disabled: ro });
+        refs[`dept_${d}`] = cb;
+        return h('label', { class: 'inline-check' }, cb, ROLES[d].label);
+      });
+      const general = h('div', { class: 'groups' },
+        group('Call Source',
+          row('Origin', field('origin', SOURCE[c.source] || 'DISPATCH', { readonly: true })),
+          row('Caller', field('caller', c.caller)),
+          row('Callback', field('callback', c.callback, { max: 20 }))),
+        group('Response',
+          row('Status', field('status', up(c.status), { readonly: true })),
+          row('Priority', field('priority', c.priority, { options: [[1, '1 - Emergency'], [2, '2 - Urgent'], [3, '3 - Routine'], [4, '4 - Low']] })),
+          row('Received', field('received', stamp(c.at), { readonly: true }))),
+        group('Location',
+          row('Postal', field('postal', c.postal, { max: 10 })),
+          row('Address', field('location', c.location)),
+          row('Hazards', field('hazards', c.hazards, { max: 120 }))),
+        group('Call Details',
+          row('Title', field('nature', c.nature, { max: 80 })),
+          row('10-Code', field('code', c.code || '', { options: codeOptions })),
+          row('Depts', h('div', null, deptBoxes))),
+        h('fieldset', { class: 'group full' }, h('legend', null, 'Units'),
+          h('div', { class: 'unit-box' }, refs.unitsBox, h('div', { class: 'side-btns' },
+            dispatch ? btn('Assign…', () => assignDialog(current())) : btn('Attach Me', () => act('attach', { id: c.id }, `Attached to #${c.num}.`)),
+            dispatch ? btn('Detach…', () => detachDialog(current())) : btn('Detach Me', () => act('detach', { id: c.id }, `Detached from #${c.num}.`)),
+            dispatch ? btn('Locate', () => app.map?.focusCall?.(c.id)) : btn('On Scene', () => act('setStatus', { status: 'onscene' }, 'On scene (10-97).'))))),
+        dispatch && isOpen(c) ? h('div', { class: 'full' }, refs.suggest) : null,
+        h('fieldset', { class: 'group full' }, h('legend', null, 'Description'), refs.details));
+      const noteInput = h('input', { placeholder: 'Type a note and press Enter', maxlength: 500, style: 'flex:1' });
+      const textInput = h('input', { placeholder: 'Text the caller and press Enter', maxlength: 500, style: 'flex:1' });
+      const pages = {
+        general,
+        notes: h('div', null, refs.notesBox,
+          h('form', { class: 'inline-form', onsubmit: (e) => {
+            e.preventDefault();
+            if (!noteInput.value.trim()) return;
+            act('addNote', { id: c.id, text: noteInput.value }).then((ok) => { if (ok) noteInput.value = ''; });
+          } }, noteInput, h('button', { class: 'btn', type: 'submit' }, 'Add Note')),
+          dispatch && c.callerUserId && isOpen(c) ? h('form', { class: 'inline-form', onsubmit: (e) => {
+            e.preventDefault();
+            if (!textInput.value.trim()) return;
+            act('textCaller', { id: c.id, text: textInput.value }, 'Text sent.').then((ok) => { if (ok) textInput.value = ''; });
+          } }, icon('messages', 16), textInput, h('button', { class: 'btn', type: 'submit' }, 'Text Caller')) : null),
+      };
+      const tabsEl = h('div', { class: 'tabs' });
+      const page = h('div', { class: 'tab-page' });
+      const showTab = (t) => {
+        tab = t;
+        tabsEl.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.t === t));
+        page.replaceChildren(pages[t]);
+        if (t === 'notes') refs.notesBox.scrollTop = refs.notesBox.scrollHeight;
+      };
+      refs.tabNotes = h('button', { class: 'tab', 'data-t': 'notes', onclick: () => showTab('notes') }, 'Notes');
+      tabsEl.append(h('button', { class: 'tab', 'data-t': 'general', onclick: () => showTab('general') }, 'General'), refs.tabNotes);
+      const buttons = h('div', { class: 'btnrow', style: 'padding:0 6px 6px' },
+        dispatch ? h('button', { class: 'btn btn-default', onclick: () => saveViewer(c) }, 'Update') : null,
+        h('button', { class: 'btn', onclick: () => noteDialog(current()) }, 'Add Note'),
+        isOpen(c) ? h('button', { class: 'btn', onclick: () => closeCallDialog(current()) }, 'Close Call') : (dispatch ? h('button', { class: 'btn', onclick: () => act('reopenCall', { id: c.id }, 'Call reopened.') }, 'Reopen') : null),
+        h('button', { class: 'btn', onclick: () => { app.selectedCall = null; refreshNow(); } }, 'Cancel'));
+      w.body.replaceChildren(tabsEl, page, buttons);
+      showTab(tab);
+      update(c);
+    }
+
+    function update(c) {
+      w.setTitle(`Call Viewer - ${PRIORITY_NAME[c.priority]} - #${c.num}${isOpen(c) ? '' : ' (CLOSED)'}`);
+      refs.status.value = up(c.status);
+      refs.tabNotes.textContent = `Notes (${c.notes.length})`;
+      refs.unitsBox.replaceChildren(grid([
+        { label: 'Unit', render: (u) => u.callsign },
+        { label: 'Name', render: (u) => up(u.name) },
+        { label: 'Status', render: (u) => (u.status ? statusText(u.status) : 'CLEARED'), cls: (u) => `cell st-${u.status || 'closed'}` },
+        { label: 'Disp', render: (u) => clock(u.disp) },
+        { label: 'Enrt', render: (u) => clock(u.enrt) },
+        { label: 'Onsc', render: (u) => clock(u.onsc) },
+      ], c.units, { key: (u) => u.userId, empty: dispatch ? 'No units. Drag one here from Active Units, or use Assign.' : 'No units assigned.' }));
+      if (dispatch && isOpen(c)) {
+        refs.unitsBox.parentElement.parentElement.classList.add('drop-zone');
+        Object.entries(dropTarget(c)).forEach(([k, fn]) => { refs.unitsBox[k] = fn; });
+        refs.suggest.replaceChildren(suggestedBox(c));
+      }
+      const box = refs.notesBox;
+      const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 10;
+      box.replaceChildren(...(c.notes.length ? c.notes.map((n) => h('div', { class: n.public ? 'pub' : '' }, h('b', null, `${clock(n.at)} ${n.by}: `), n.text)) : [h('div', null, 'No notes.')]));
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+
+    async function saveViewer(c) {
+      const body = {
+        id: c.id,
+        caller: refs.caller.value,
+        callback: refs.callback.value,
+        priority: Number(refs.priority.value),
+        postal: refs.postal.value,
+        location: refs.location.value,
+        hazards: refs.hazards.value,
+        nature: refs.nature.value,
+        code: refs.code.value,
+        details: refs.details.value,
+        depts: UNIT_ROLES.filter((d) => refs[`dept_${d}`].checked),
+        imported: true,
+      };
+      if (!body.depts.length) return toast('Pick at least one department.', 'error');
+      const ok = await act('updateCall', body, `Call #${c.num} updated.`);
+      if (ok) build(selectedCallObj());
+      return ok;
+    }
+
+    let lastKey = '';
+    app.updaters.push(() => {
+      const c = current();
+      if ((c?.id || null) !== shownId) { build(c); lastKey = ''; }
+      if (!c) return;
+      const k = JSON.stringify([c.units, c.notes.length, c.status, dispatch ? suggestedUnits(c).map((x) => [x.u.userId, Math.round(x.d / 50)]) : 0]);
+      if (k !== lastKey) { lastKey = k; update(c); }
+    });
+    build(current());
+    return w.el;
+  }
+
+  // ---------- Call dialogs ----------
+
+  function newCallDialog(existing, preset = {}) {
+    const isUnit = !isDispatch();
+    if (isUnit && !app.data.myUnit) return toast('Clock in first.', 'error');
+    const editing = Boolean(existing && existing.id) && !isUnit;
+    const importing = Boolean(preset.importing);
+    const base = existing || preset;
+    const depts = base.depts || (isUnit ? [app.role] : ['police']);
+    const codeOptions = [['', '-- None --'], ...CALL_CODES.map(([code, t]) => [code, `${code} ${t}`])];
+    const inputs = formDialog({
+      id: 'newcall',
+      title: importing ? `Import 911 Call #${existing.num}` : editing ? `Edit Call #${existing.num}` : isUnit ? 'Self-Initiated Call' : 'New Call',
+      submitLabel: importing ? 'Import Call' : editing ? 'Update' : 'Create Call',
+      width: 560,
+      icon: 'newcall',
+      fields: [
+        { name: 'code', label: '10-Code', type: 'select', value: base.code || '', options: codeOptions },
+        { name: 'priority', label: 'Priority', type: 'select', value: base.priority ?? 2, options: [[1, '1 - Emergency'], [2, '2 - Urgent'], [3, '3 - Routine'], [4, '4 - Low']] },
+        { name: 'nature', label: 'Call title', value: base.nature, required: true, wide: true, max: 80 },
+        { name: 'location', label: 'Address', value: base.location || (isUnit ? app.data.myUnit.location : ''), max: 120 },
+        { name: 'postal', label: 'Postal', value: base.postal || (isUnit ? app.data.myUnit.postal : ''), max: 10 },
+        { name: 'caller', label: 'Caller', value: base.caller, max: 80 },
+        { name: 'callback', label: 'Callback', value: base.callback, max: 20 },
+        isUnit && app.role === 'police' ? { name: 'plate', label: 'Plate', value: base.plate, max: 10 } : null,
+        { name: 'hazards', label: 'Hazards', value: base.hazards, max: 120, placeholder: 'Weapons, fire, downed lines…', wide: !(isUnit && app.role === 'police') },
+        { name: 'dept_police', label: 'Police', type: 'checkbox', value: depts.includes('police') },
+        { name: 'dept_fire', label: 'Fire / EMS', type: 'checkbox', value: depts.includes('fire') },
+        { name: 'dept_dot', label: 'DOT', type: 'checkbox', value: depts.includes('dot') },
+        { name: 'details', label: 'Description', type: 'textarea', value: base.details, max: 1000 },
+      ],
+      onSubmit: async (v) => {
+        const body = { code: v.code, nature: v.nature, priority: Number(v.priority), location: v.location, postal: v.postal, caller: v.caller, callback: v.callback, hazards: v.hazards, details: v.details, depts: UNIT_ROLES.filter((d) => v[`dept_${d}`]) };
+        if (!body.depts.length) { toast('Pick at least one department.', 'error'); return false; }
+        if (editing || importing) {
+          const ok = await act('updateCall', { id: existing.id, ...body, imported: importing || undefined }, importing ? `Call #${existing.num} imported. Assign units now.` : `Call #${existing.num} updated.`);
+          if (ok) selectCall(existing.id);
+          return ok;
+        }
+        if (v.plate) body.plate = v.plate;
+        const res = await act('createCall', body, isUnit ? 'Self-initiated call created.' : 'Call created.');
+        if (res?.id) selectCall(res.id);
+        return res;
+      },
+    });
+    // Picking a 10-code fills the title, departments and priority.
+    inputs.code.addEventListener('change', () => {
+      const c = CALL_CODES.find(([code]) => code === inputs.code.value);
+      if (!c) return;
+      inputs.nature.value = c[1];
+      inputs.priority.value = String(c[3]);
+      for (const d of UNIT_ROLES) inputs[`dept_${d}`].checked = c[2].includes(d);
+    });
+    return inputs;
+  }
+
+  function assignDialog(call) {
+    if (!call) return toast('Select a call first.', 'error');
+    const free = (app.data.units || []).filter((u) => !call.units.some((x) => x.userId === u.userId));
+    if (!free.length) return toast('No other units are logged on.', 'error');
+    const pos = callPos(call);
+    const dist = (u) => (pos && Number.isFinite(u.x) ? Math.hypot(u.x - pos.x, u.z - pos.z) : Infinity);
+    const order = (u) => (onCall(u.userId) ? 4 : 0) + (u.status === 'available' ? 0 : 1) + (call.depts.includes(u.dept) ? 0 : 2);
+    const sorted = [...free].sort((a, b) => order(a) - order(b) || dist(a) - dist(b));
+    return formDialog({
+      title: `Assign Unit - #${call.num} ${callTitle(call)}`,
+      submitLabel: 'Dispatch',
+      icon: 'dispatch',
+      fields: [{ name: 'userId', label: 'Unit', type: 'select', wide: true, options: sorted.map((u) => [u.userId, `${u.callsign} · ${u.name} · ${agencyShort(u)} · ${statusText(u.status)}${onCall(u.userId) ? ` · ON #${onCall(u.userId).num}` : ''}${Number.isFinite(dist(u)) ? ` · ${distLabel(dist(u))} studs` : ''}`]) }],
+      onSubmit: (v) => act('attach', { id: call.id, userId: v.userId }, 'Unit dispatched.'),
+    });
+  }
+
+  function detachDialog(call) {
+    if (!call) return toast('Select a call first.', 'error');
+    if (!call.units.length) return toast('No units on this call.', 'error');
+    return formDialog({
+      title: `Detach Unit - #${call.num}`,
+      submitLabel: 'Detach',
+      icon: 'units',
+      fields: [{ name: 'userId', label: 'Unit', type: 'select', wide: true, options: call.units.map((u) => [u.userId, `${u.callsign} · ${u.name}`]) }],
+      onSubmit: (v) => act('detach', { id: call.id, userId: v.userId }, 'Unit detached.'),
+    });
+  }
+
+  function noteDialog(call) {
+    if (!call) return toast('Select a call first.', 'error');
+    return formDialog({
+      title: `Add Note - #${call.num}`,
+      submitLabel: 'Add Note',
+      icon: 'notepad',
+      fields: [{ name: 'text', label: 'Note', type: 'textarea', required: true, max: 500 }],
+      onSubmit: (v) => act('addNote', { id: call.id, text: v.text }, 'Note added.'),
+    });
+  }
+
+  function closeCallDialog(call) {
+    if (!call) return toast('Select a call first.', 'error');
+    const dispositions = ['Report taken', 'Citation issued', 'Arrest made', 'Warning given', 'Transported', 'Patient refused care', 'Fire extinguished', 'Towed', 'Road cleared', 'Unfounded', 'Gone on arrival', 'Duplicate call', 'Cancelled by caller'];
+    return formDialog({
+      title: `Close Call - #${call.num}`,
+      submitLabel: 'Close Call',
+      danger: true,
+      icon: 'check',
+      fields: [{ name: 'disposition', label: 'Disposition', type: 'select', wide: true, options: dispositions.map((x) => [x, x]) }],
+      onSubmit: (v) => act('closeCall', { id: call.id, disposition: v.disposition }, `Call #${call.num} closed.`),
+    });
+  }
+
+  // Read-only call card, for calls that dropped off the live list.
+  function callCard(c) {
+    return h('div', { class: 'result' },
+      h('h4', null, `#${c.num} ${callCode(c)} ${up(callTitle(c))}`, flag(up(c.status), isOpen(c) ? 'green' : 'gray'), flag(PRIORITY_NAME[c.priority], c.priority === 1 ? 'red' : c.priority === 2 ? 'amber' : 'gray')),
+      h('div', { class: 'kv' }, [['RECEIVED', stamp(c.at)], ['CLOSED', stamp(c.closedAt)], ['SOURCE', SOURCE[c.source] || 'DISPATCH'], ['CALLER', c.caller], ['POSTAL', c.postal], ['ADDRESS', c.location], ['DISPO', c.disposition]].filter(([, v]) => v).map(([k, v]) => h('div', null, h('b', null, `${k}:`), up(v)))),
+      c.details ? h('div', { style: 'margin-top:3px' }, h('b', null, 'DETAILS: '), up(c.details)) : null,
+      h('div', { class: 'sec' }, `Units (${c.units.length})`),
+      h('div', null, c.units.length ? c.units.map((u) => `${u.callsign} ${up(u.name)}`).join(' · ') : 'NONE'),
+      h('div', { class: 'sec' }, `Notes (${c.notes.length})`),
+      h('div', { class: 'notes-list', style: 'max-height:200px;overflow:auto' }, c.notes.length ? c.notes.map((n) => h('div', null, h('b', null, `${clock(n.at)} ${n.by}: `), n.text)) : 'No notes.'));
+  }
+
+  // Get Call: find any call by its number, open or closed.
+  function getCallDialog(num) {
+    const input = h('input', { placeholder: 'Call number, e.g. 1042', maxlength: 30, style: 'flex:1', value: num || '' });
+    const box = h('div', { style: 'margin-top:6px' });
+    const run = async () => {
+      const q = input.value.trim().replace('#', '');
+      if (!q) return toast('Type a call number.', 'error');
+      try {
+        const { results } = await api(`/api/cad/search?type=call&q=${encodeURIComponent(q)}`);
+        const exact = results.find((c) => String(c.num) === q);
+        const list = exact ? [exact] : results;
+        if (!list.length) { box.replaceChildren(h('div', { class: 'term' }, h('div', { class: 'term-line miss' }, `NO CALL MATCHING "${up(q)}".`))); return; }
+        box.replaceChildren(...list.slice(0, 6).map((c) => h('div', null, callCard(c), h('div', { class: 'btnrow left', style: 'margin:-4px 0 8px' },
+          (app.data.calls || []).some((x) => x.id === c.id) ? btn('Open in Viewer', () => { selectCall(c.id); d.close(); }) : null,
+          isDispatch() && !isOpen(c) ? btn('Reopen', () => act('reopenCall', { id: c.id }, `Call #${c.num} reopened.`).then(() => selectCall(c.id))) : null))));
+      } catch (err) { toast(err.message, 'error'); }
+    };
+    const d = openDialog({ id: 'getcall', title: 'Get Call', width: 640, icon: 'getcall', content: h('div', null,
+      h('form', { class: 'inline-form', onsubmit: (e) => { e.preventDefault(); run(); } }, h('label', null, 'Call #:'), input, h('button', { class: 'btn btn-default', type: 'submit' }, 'Get Call')),
+      box) });
+    if (num) run();
+    return d;
+  }
+
+  function callHistoryDialog() {
+    let selected = null;
+    return liveDialog({ id: 'history', title: 'Call History', width: 860, icon: 'history' }, (d) => [(d.calls || []).filter((c) => !isOpen(c)).map((c) => c.id), selected], (dlg) => {
+      const closed = myCalls(app.data).filter((c) => !isOpen(c)).sort((a, b) => (b.closedAt || b.at) - (a.closedAt || a.at));
+      dlg.setTitle(`Call History - ${closed.length} Recent Closed Calls`);
+      const pick = closed.find((c) => c.id === selected);
+      return [
+        h('div', { class: 'btnrow left', style: 'padding:0 0 6px' }, h('button', { class: 'btn', onclick: () => getCallDialog() }, 'Search Older Calls…')),
+        h('div', { class: 'ref-table', style: 'max-height:36vh' }, grid([
+          { label: 'ID', render: (c) => String(c.num) },
+          { label: 'Received', render: (c) => stamp(c.at) },
+          { label: 'Closed', render: (c) => clock(c.closedAt) },
+          { label: 'Code', render: (c) => callCode(c) },
+          { label: 'Call Title', render: (c) => up(callTitle(c)) },
+          { label: 'Address', render: (c) => up(c.location) },
+          { label: 'Units', render: (c) => c.units.map((u) => u.callsign).join(' ') },
+          { label: 'Disposition', render: (c) => up(c.disposition) },
+        ], closed, { selected, onSelect: (c) => { selected = c.id; refreshNow(); }, empty: 'No closed calls yet.' })),
+        pick ? h('div', { style: 'margin-top:6px' }, callCard(pick)) : h('div', { class: 'empty' }, 'Click a call to read its notes.'),
+      ];
+    });
+  }
+
+  // ---------- Live map (the real ER:LC map) ----------
+  // ER:LC positions (LocationX, LocationZ) are game units. The bot lines the
+  // official 5355x5355 map image up with them from the postals it has seen
+  // (bot/src/cadMapCal.js): image pixel = a * X + b, c * Z + d. Markers are
+  // drawn in game units and the image is placed to match.
+
+  const MAP_FALLBACK = 'https://api.erlc.gg/maps/';
+  const MAP_SIZE = 5355;
+  const MY_PIN = '#1d63c9'; // your own marker on the map
+  const MAP_HALF = MAP_SIZE / 2;
+  const mapCal = () => {
+    const k = app.data.mapCal;
+    return k && k.a && k.c ? k : { a: 1, b: MAP_HALF, c: 1, d: MAP_HALF, n: 0 };
+  };
+  // Image pixels per game unit, for zoom levels and distances meant in pixels.
+  const ka = () => Math.abs(mapCal().a) || 1;
+  // The image's corners in game units.
+  function imageBox() {
+    const k = mapCal();
+    const xs = [(0 - k.b) / k.a, (MAP_SIZE - k.b) / k.a];
+    const zs = [(0 - k.d) / k.c, (MAP_SIZE - k.d) / k.c];
+    return { x0: Math.min(...xs), x1: Math.max(...xs), z0: Math.min(...zs), z1: Math.max(...zs) };
+  }
+  const MAP_SEASONS = ['fall', 'snow', 'spring', 'summer'];
+  function mapName() {
+    const p = prefs();
+    return `${MAP_SEASONS.includes(p.mapStyle) ? p.mapStyle : 'fall'}_${p.mapPostals === false ? 'blank' : 'postals'}`;
+  }
+
+
+  // ---- Directions ----
+  // A blue route line from you to a call or postal. The bot learns the roads
+  // from where people drive in game (bot/src/cadRoutes.js) and routes along
+  // them; areas nobody has driven yet are crossed in a straight line.
+  const mapDraws = new Set();
+  const redrawMaps = () => { for (const d of [...mapDraws]) d(); };
+  function myPos() {
+    const u = app.data.myUnit;
+    if (u && Number.isFinite(u.x) && Number.isFinite(u.z)) return { x: u.x, z: u.z };
+    const p = app.data.ingame?.player;
+    return p && Number.isFinite(p.x) && Number.isFinite(p.z) ? { x: p.x, z: p.z } : null;
+  }
+  function setRoute(to) {
+    app.route = to ? { ...to, data: null, from: null, busy: false } : null;
+    updateRoute(true);
+    redrawMaps();
+  }
+  function clearRoute() {
+    if (app.route?.callId) app.routeDismissed = app.route.callId;
+    app.route = null;
+    redrawMaps();
+  }
+  async function updateRoute(force) {
+    const r = app.route;
+    if (!r || r.busy) return;
+    const me = myPos();
+    if (!me) return;
+    if (Math.hypot(me.x - r.x, me.z - r.z) < 70 / ka() && r.data) {
+      toast(`Arrived: ${r.label}.`);
+      clearRoute();
+      return;
+    }
+    if (!force && r.from && Math.hypot(me.x - r.from.x, me.z - r.from.z) < 90 / ka()) return;
+    r.busy = true;
+    try {
+      const d = await api(`/api/cad/route?from=${Math.round(me.x)},${Math.round(me.z)}&to=${Math.round(r.x)},${Math.round(r.z)}`);
+      if (app.route === r) { r.data = d; r.from = me; }
+    } catch { /* keep the last route */ } finally { r.busy = false; }
+    redrawMaps();
+  }
+  // Runs every refresh: follows my call automatically and keeps the route fresh.
+  function routeTick() {
+    if (!UNIT_ROLES.includes(app.role) && app.role !== 'civilian') return;
+    const c = UNIT_ROLES.includes(app.role) ? C.myOpenCall() : null;
+    if (app.route?.callId && (!c || c.id !== app.route.callId)) app.route = null;
+    if (!app.route && c && app.routeDismissed !== c.id && prefs().autoRoute !== false) {
+      const p = callPos(c);
+      if (p) return setRoute({ x: p.x, z: p.z, label: `#${c.num} ${callTitle(c)}`, callId: c.id });
+    }
+    updateRoute(false);
+  }
+  function routeToCall(c) {
+    const p = callPos(c);
+    if (!p) return toast('That call has no map position.', 'error');
+    if (!myPos()) return toast('Join the ER:LC server to get directions.', 'error');
+    setRoute({ x: p.x, z: p.z, label: `#${c.num} ${callTitle(c)}`, callId: c.id });
+    app.map?.center?.((myPos().x + p.x) / 2, (myPos().z + p.z) / 2);
+  }
+
+  function mapView({ follow = false, compact = false } = {}) {
+    const postal = h('input', { style: 'width:56px', maxlength: 10, placeholder: 'Postal' });
+    const layers = { units: true, calls: true, hazards: true, players: !prefs().hidePlayers };
+    const box = (key, label) => h('label', null, h('input', { type: 'checkbox', checked: layers[key], onchange: (e) => { layers[key] = e.target.checked; draw(); } }), label);
+    const followBox = h('input', { type: 'checkbox', checked: follow, onchange: () => { if (followBox.checked) centerOnMe(); } });
+    const routeInfo = h('span', { class: 'route-info' });
+    const tools = h('div', { class: 'map-tools' },
+      h('label', null, 'Go:', postal), btn('Go', () => goPostal()), routeInfo,
+      box('units', 'Units'), box('calls', 'Calls'), box('hazards', 'Hazards/Tows'), app.role !== 'civilian' ? box('players', 'Players') : null,
+      UNIT_ROLES.includes(app.role) ? h('label', null, followBox, 'Follow me') : null,
+      h('span', { style: 'flex:1' }),
+      app.data.me?.admin ? btn('Calibrate', () => startCalibrate(), '', 'Admins: line the map up with the game. Stand somewhere in game, press this, then click where you really are on the map.') : null,
+      app.data.me?.admin ? btn('Reset', () => confirmDialog('Reset Map Points', 'Remove every point admins have set? The map goes back to lining itself up from postals alone.', 'Reset', () => act('clearMapAnchors', {}, 'Map points removed.')), '', 'Admins: remove the calibration points') : null,
+      btn('−', () => zoom(1 / 1.4), '', 'Zoom out'), btn('+', () => zoom(1.4), '', 'Zoom in'), btn('Fit', () => fit(), '', 'Whole map (F9)'));
+    const canvas = h('canvas');
+    const empty = h('div', { class: 'map-empty' });
+    const wrap = h('div', { class: 'map-wrap' }, canvas, empty);
+    const fCoord = h('span', null, 'X -- Z --');
+    const fPostal = h('span', null, 'Postal --');
+    const fCount = h('span', { style: 'flex:1' }, '');
+    const fSrc = h('span', null, 'Loading map…');
+    const foot = h('div', { class: 'map-foot' }, fCoord, fPostal, fCount, fSrc);
+    const el = h('div', { class: `map-view ${compact ? 'compact' : ''}` }, tools, wrap, foot);
+
+    let view = null; // { cx, cz, scale }
+    let autoFit = true;
+    let img = null;
+    let imgOk = false;
+    let hits = [];
+    postal.addEventListener('keydown', (e) => { if (e.key === 'Enter') goPostal(); });
+
+    function loadImage() {
+      const name = mapName();
+      const next = new Image();
+      next.decoding = 'async';
+      let triedFallback = false;
+      next.onload = () => {
+        img = next;
+        imgOk = true;
+        fSrc.textContent = `ER:LC map (${name.split('_')[0] === 'snow' ? 'winter' : name.split('_')[0]})`;
+        fSrc.title = mapCal().n ? `Lined up with the game from ${mapCal().n} postals` : 'Not lined up yet: it lines itself up once players have been seen in a few postals.';
+        if (autoFit) fit(); else draw();
+      };
+      next.onerror = () => {
+        if (!triedFallback) { triedFallback = true; next.src = `${MAP_FALLBACK}${name}.png`; return; }
+        imgOk = false;
+        fSrc.textContent = 'Map image unavailable';
+        draw();
+      };
+      next.src = `/api/cad/map/${name}`;
+    }
+
+    const points = () => {
+      const d = app.data;
+      const units = (d.units || []).filter((u) => Number.isFinite(u.x) && Number.isFinite(u.z));
+      const calls = (d.calls || []).filter(isOpen).map((c) => ({ c, p: callPos(c) })).filter((x) => x.p);
+      const hazards = (d.hazards || []).filter((x) => x.status === 'open' && Number.isFinite(x.x));
+      const tows = (d.tows || []).filter((t) => !['delivered', 'declined'].includes(t.status) && Number.isFinite(t.x));
+      const players = (d.players || []).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.z));
+      return { units, calls, hazards, tows, players };
+    };
+
+    function worldBounds() {
+      if (imgOk) return imageBox();
+      const { units, calls, players } = points();
+      const pts = [...units.map((u) => [u.x, u.z]), ...calls.map((x) => [x.p.x, x.p.z]), ...players.map((p) => [p.x, p.z]), ...Object.values(app.data.postals || {}).map((p) => [p.x, p.z])];
+      if (!pts.length) return null;
+      const xs = pts.map((a) => a[0]);
+      const zs = pts.map((a) => a[1]);
+      return { x0: Math.min(...xs) - 200, z0: Math.min(...zs) - 200, x1: Math.max(...xs) + 200, z1: Math.max(...zs) + 200 };
+    }
+
+    function fit() {
+      autoFit = true;
+      const b = worldBounds();
+      const r = wrap.getBoundingClientRect();
+      if (!b || !r.width) { view = null; draw(); return; }
+      view = { cx: (b.x0 + b.x1) / 2, cz: (b.z0 + b.z1) / 2, scale: Math.min(r.width / (b.x1 - b.x0), r.height / (b.z1 - b.z0)) * 0.98 };
+      draw();
+    }
+    function zoom(f, at) {
+      if (!view) fit();
+      if (!view) return;
+      autoFit = false;
+      const r = wrap.getBoundingClientRect();
+      if (at) {
+        const [wx, wz] = toWorld(at[0], at[1], r);
+        view.scale = Math.min(8 * ka(), Math.max(0.03 * ka(), view.scale * f));
+        view.cx = wx - (at[0] - r.width / 2) / view.scale;
+        view.cz = wz - (at[1] - r.height / 2) / view.scale;
+      } else view.scale = Math.min(8 * ka(), Math.max(0.03 * ka(), view.scale * f));
+      draw();
+    }
+    function center(x, z, scale) {
+      const r = wrap.getBoundingClientRect();
+      view = { cx: x, cz: z, scale: scale || view?.scale || (Math.min(r.width, r.height) / 1200) * ka() };
+      autoFit = false;
+      draw();
+    }
+    function goPostal() {
+      const p = app.data.postals?.[postal.value.trim()];
+      if (!p) return toast(`Postal ${postal.value.trim()} is not known yet. The CAD learns postals as players drive through them.`, 'error');
+      if (app.role !== 'dispatcher' && app.role !== 'law') {
+        const me = myPos();
+        if (me) {
+          setRoute({ x: p.x, z: p.z, label: `Postal ${postal.value.trim()}` });
+          return center((me.x + p.x) / 2, (me.z + p.z) / 2, Math.max(0.12 * ka(), Math.min(ka(), Math.min(wrap.clientWidth, wrap.clientHeight) / (Math.hypot(me.x - p.x, me.z - p.z) * 1.3 + 1))));
+        }
+        toast('Join the ER:LC server to get directions. Showing the postal instead.');
+      }
+      return center(p.x, p.z, Math.max(view?.scale || 0, ka()));
+    }
+    function focusUnit(userId) {
+      const u = (app.data.units || []).find((x) => x.userId === userId);
+      if (!u || !Number.isFinite(u.x)) return toast('No in-game position for that unit yet.', 'error');
+      return center(u.x, u.z, Math.max(view?.scale || 0, 1.2 * ka()));
+    }
+    function focusCall(id) {
+      const c = (app.data.calls || []).find((x) => x.id === id);
+      const p = callPos(c);
+      if (!p) return toast('That call has no map position.', 'error');
+      return center(p.x, p.z, Math.max(view?.scale || 0, 1.2 * ka()));
+    }
+    function centerOnMe() {
+      const u = app.data.myUnit;
+      if (u && Number.isFinite(u.x)) center(u.x, u.z, view && !autoFit ? view.scale : 0.6 * ka());
+    }
+
+    const toScreen = (x, z, r) => [r.width / 2 + (x - view.cx) * view.scale, r.height / 2 + (z - view.cz) * view.scale];
+    const toWorld = (px, pz, r) => [view.cx + (px - r.width / 2) / view.scale, view.cz + (pz - r.height / 2) / view.scale];
+
+    function draw() {
+      const r = wrap.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(r.width * dpr);
+      canvas.height = Math.round(r.height * dpr);
+      const g = canvas.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.fillStyle = '#1b2a33';
+      g.fillRect(0, 0, r.width, r.height);
+      hits = [];
+      const pts = points();
+      if (!view) {
+        empty.textContent = imgOk ? '' : 'Loading the ER:LC map…';
+        if (imgOk || pts.units.length || pts.calls.length) fit();
+        return;
+      }
+      if (imgOk) {
+        // Image pixel p sits at game X = (p - b) / a.
+        const k = mapCal();
+        const [sx, sz] = toScreen(-k.b / k.a, -k.d / k.c, r);
+        g.imageSmoothingEnabled = view.scale / Math.abs(k.a) < 2;
+        g.save();
+        g.translate(sx, sz);
+        g.scale((view.scale / k.a) * (MAP_SIZE / img.naturalWidth), (view.scale / k.c) * (MAP_SIZE / img.naturalHeight));
+        g.drawImage(img, 0, 0);
+        g.restore();
+        empty.textContent = '';
+      } else {
+        // No image: a grid so positions still make sense.
+        const step = 250;
+        const [x0, z0] = toWorld(0, 0, r);
+        const [x1, z1] = toWorld(r.width, r.height, r);
+        g.strokeStyle = 'rgba(160, 190, 200, 0.12)';
+        for (let x = Math.floor(x0 / step) * step; x <= x1; x += step) { const [sx] = toScreen(x, 0, r); g.beginPath(); g.moveTo(sx, 0); g.lineTo(sx, r.height); g.stroke(); }
+        for (let z = Math.floor(z0 / step) * step; z <= z1; z += step) { const [, sz] = toScreen(0, z, r); g.beginPath(); g.moveTo(0, sz); g.lineTo(r.width, sz); g.stroke(); }
+        empty.textContent = pts.units.length || pts.calls.length ? '' : 'The ER:LC map could not load. Units and calls still show here once they are in game.';
+      }
+      g.textBaseline = 'middle';
+      const visible = (sx, sz) => sx > -60 && sz > -30 && sx < r.width + 60 && sz < r.height + 30;
+      const label = (sx, sz, text, bg, fg) => {
+        g.font = 'bold 11px Tahoma, sans-serif';
+        const tw = g.measureText(text).width + 6;
+        g.fillStyle = bg;
+        g.fillRect(sx, sz - 7, tw, 14);
+        g.strokeStyle = '#000';
+        g.lineWidth = 1;
+        g.strokeRect(sx + 0.5, sz - 6.5, tw - 1, 13);
+        g.fillStyle = fg;
+        g.fillText(text, sx + 3, sz + 0.5);
+      };
+      const inView = { u: 0, c: 0 };
+      const rt = app.route;
+      if (rt?.data?.points?.length > 1) {
+        const me = myPos();
+        const line = rt.data.points.map(([x, z]) => toScreen(x, z, r));
+        if (me) line[0] = toScreen(me.x, me.z, r);
+        g.lineJoin = 'round';
+        g.lineCap = 'round';
+        for (const [w, col] of [[9, 'rgba(10, 40, 90, 0.85)'], [6, '#3d9bff']]) {
+          g.beginPath();
+          line.forEach(([x, z], i) => (i ? g.lineTo(x, z) : g.moveTo(x, z)));
+          g.lineWidth = w;
+          g.strokeStyle = col;
+          g.stroke();
+        }
+        g.lineWidth = 1;
+      }
+      if (rt) {
+        // Destination pin.
+        const [px, pz] = toScreen(rt.x, rt.z, r);
+        g.beginPath();
+        g.moveTo(px, pz);
+        g.bezierCurveTo(px - 9, pz - 12, px - 9, pz - 24, px, pz - 24);
+        g.bezierCurveTo(px + 9, pz - 24, px + 9, pz - 12, px, pz);
+        g.fillStyle = '#ff4040';
+        g.fill();
+        g.strokeStyle = '#fff';
+        g.lineWidth = 2;
+        g.stroke();
+        g.beginPath();
+        g.arc(px, pz - 16, 3.5, 0, Math.PI * 2);
+        g.fillStyle = '#fff';
+        g.fill();
+        g.lineWidth = 1;
+      }
+      routeInfo.replaceChildren(...(rt ? [
+        h('span', { class: 'route-label', title: rt.data && rt.data.learned < 0.5 ? 'Parts of this route have not been driven in game yet, so they are drawn straight.' : '' },
+          `Route: ${rt.label}${rt.data ? '' : !myPos() ? ' (not in game)' : '…'}${rt.data && rt.data.learned < 0.5 ? ' (roads still learning)' : ''}`),
+        btn('Clear', clearRoute, '', 'Clear the route'),
+      ] : []));
+      if (layers.players) {
+        const unitIds = new Set(pts.units.map((u) => u.userId));
+        for (const p of pts.players) {
+          if (p.userId && unitIds.has(p.userId)) continue;
+          if (p.userId && p.userId === me()) continue; // drawn as YOU below
+          const [sx, sz] = toScreen(p.x, p.z, r);
+          if (!visible(sx, sz)) continue;
+          // Same pin as a unit, in one neutral colour.
+          g.beginPath();
+          g.arc(sx, sz, 6, 0, Math.PI * 2);
+          g.fillStyle = '#e8e8e8';
+          g.fill();
+          g.lineWidth = 1.5;
+          g.strokeStyle = '#000';
+          g.stroke();
+          g.lineWidth = 1;
+          label(sx + 8, sz - 11, p.callsign || p.name, '#e8e8e8', '#000');
+          hits.push({ sx, sz, kind: 'player', label: `${p.name}${p.team ? ` (${p.team})` : ''}${p.callsign ? ` ${p.callsign}` : ''}` });
+        }
+      }
+      if (layers.hazards) {
+        for (const hz of pts.hazards) {
+          const [sx, sz] = toScreen(hz.x, hz.z, r);
+          if (!visible(sx, sz)) continue;
+          g.beginPath();
+          g.moveTo(sx, sz - 8); g.lineTo(sx + 8, sz + 6); g.lineTo(sx - 8, sz + 6); g.closePath();
+          g.fillStyle = '#f2c230'; g.fill(); g.strokeStyle = '#000'; g.stroke();
+          g.fillStyle = '#000'; g.font = 'bold 10px Tahoma'; g.fillText('!', sx - 1.5, sz + 1);
+          hits.push({ sx, sz, kind: 'hazard', label: `${hz.num} ${hz.hazard}` });
+        }
+        for (const t of pts.tows) {
+          const [sx, sz] = toScreen(t.x, t.z, r);
+          if (!visible(sx, sz)) continue;
+          label(sx - 10, sz, 'TOW', '#f08c1a', '#000');
+          hits.push({ sx, sz, kind: 'tow', label: `${t.num} ${t.plate || ''} ${t.status}` });
+        }
+      }
+      if (layers.calls) {
+        for (const { c, p } of pts.calls) {
+          const [sx, sz] = toScreen(p.x, p.z, r);
+          if (!visible(sx, sz)) continue;
+          inView.c += 1;
+          const sel = c.id === app.selectedCall;
+          g.fillStyle = c.priority === 1 ? '#ff3030' : c.status === 'pending' ? '#ffd400' : '#33cc33';
+          g.beginPath();
+          g.moveTo(sx, sz - 8); g.lineTo(sx + 8, sz); g.lineTo(sx, sz + 8); g.lineTo(sx - 8, sz); g.closePath();
+          g.fill();
+          g.lineWidth = sel ? 3 : 1;
+          g.strokeStyle = sel ? '#fff' : '#000';
+          g.stroke();
+          g.lineWidth = 1;
+          label(sx + 10, sz, `#${c.num} ${callCode(c) || up(callTitle(c)).slice(0, 14)}`.trim(), '#ffffff', '#000');
+          hits.push({ sx, sz, kind: 'call', id: c.id, label: `#${c.num} ${callTitle(c)}` });
+        }
+      }
+      if (layers.units) {
+        for (const u of pts.units) {
+          const [sx, sz] = toScreen(u.x, u.z, r);
+          if (!visible(sx, sz)) continue;
+          inView.u += 1;
+          const mine = u.userId === me();
+          const sel = u.userId === app.selectedUnit;
+          g.beginPath();
+          g.arc(sx, sz, 6, 0, Math.PI * 2);
+          g.fillStyle = mine ? MY_PIN : STATUS_COLOR[u.status];
+          g.fill();
+          g.lineWidth = mine || sel ? 3 : 1.5;
+          g.strokeStyle = mine || sel ? '#fff' : '#000';
+          g.stroke();
+          g.lineWidth = 1;
+          if (mine) label(sx + 8, sz - 11, u.callsign, MY_PIN, '#fff');
+          else label(sx + 8, sz - 11, u.callsign, STATUS_COLOR[u.status], ['onscene', 'panic', 'transport'].includes(u.status) ? '#fff' : '#000');
+          hits.push({ sx, sz, kind: 'unit', id: u.userId, label: `${u.callsign} ${u.name} ${statusText(u.status)}` });
+        }
+      }
+      // Where you are in game when you are not on a unit (dispatch, civilians):
+      // also what an admin compares against when lining the map up.
+      const meNow = !app.data.myUnit && app.data.ingame?.detected ? myPos() : null;
+      if (meNow) {
+        const [sx, sz] = toScreen(meNow.x, meNow.z, r);
+        g.beginPath();
+        g.arc(sx, sz, 6, 0, Math.PI * 2);
+        g.fillStyle = MY_PIN;
+        g.fill();
+        g.lineWidth = 3;
+        g.strokeStyle = '#fff';
+        g.stroke();
+        g.lineWidth = 1;
+        label(sx + 8, sz - 11, 'YOU', MY_PIN, '#fff');
+      }
+      fCount.textContent = `${inView.u} units · ${inView.c} calls in view${pts.players.length ? ` · ${pts.players.length} in game` : ''}`;
+    }
+
+    // Pan with drag, zoom with the wheel, click a marker to select it.
+    let dragged = false;
+    canvas.addEventListener('pointerdown', (e) => {
+      if (!view) return;
+      const sx = e.clientX;
+      const sz = e.clientY;
+      const start = { ...view };
+      dragged = false;
+      canvas.setPointerCapture(e.pointerId);
+      const move = (ev) => {
+        if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sz) > 3) dragged = true;
+        if (!dragged) return;
+        autoFit = false;
+        followBox.checked = false;
+        view.cx = start.cx - (ev.clientX - sx) / view.scale;
+        view.cz = start.cz - (ev.clientY - sz) / view.scale;
+        draw();
+      };
+      const stop = () => { canvas.removeEventListener('pointermove', move); canvas.removeEventListener('pointerup', stop); };
+      canvas.addEventListener('pointermove', move);
+      canvas.addEventListener('pointerup', stop);
+    });
+    const nearest = (e) => {
+      const r = wrap.getBoundingClientRect();
+      const px = e.clientX - r.left;
+      const pz = e.clientY - r.top;
+      let best = null;
+      for (const hit of hits) {
+        const d = Math.hypot(hit.sx - px, hit.sz - pz);
+        if (d < 12 && (!best || d < best.d)) best = { ...hit, d };
+      }
+      return best;
+    };
+    let calibrating = false;
+    function startCalibrate() {
+      if (!app.data.ingame?.detected) return toast('Join the ER:LC server first. The CAD needs your in-game position to line the map up.', 'error');
+      calibrating = true;
+      canvas.style.cursor = 'crosshair';
+      toast('Zoom in, then click exactly where you are standing in game. Press Esc to cancel.');
+      const esc = (e) => { if (e.key === 'Escape') { calibrating = false; canvas.style.cursor = ''; } window.removeEventListener('keydown', esc); };
+      window.addEventListener('keydown', esc);
+    }
+    canvas.addEventListener('click', (e) => {
+      if (dragged) return;
+      if (calibrating) {
+        calibrating = false;
+        canvas.style.cursor = '';
+        const r = wrap.getBoundingClientRect();
+        const [x, z] = toWorld(e.clientX - r.left, e.clientY - r.top, r);
+        const k = mapCal();
+        const px = k.a * x + k.b;
+        const pz = k.c * z + k.d;
+        confirmDialog('Line Up the Map', 'Set this spot as where you are standing in game right now? The map shifts to match. A couple more points in other parts of the map give the best fit.', 'Set Point',
+          () => act('mapAnchor', { px, pz }, 'Map point saved. The map is lined up again.'));
+        return;
+      }
+      const hit = nearest(e);
+      if (!hit) return;
+      if (hit.kind === 'call') selectCall(hit.id);
+      else if (hit.kind === 'unit') { app.selectedUnit = hit.id; refreshNow(); toast(hit.label); }
+      else toast(hit.label);
+    });
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const r = wrap.getBoundingClientRect();
+      zoom(e.deltaY < 0 ? 1.25 : 1 / 1.25, [e.clientX - r.left, e.clientY - r.top]);
+    }, { passive: false });
+    canvas.addEventListener('mousemove', (e) => {
+      if (!view) return;
+      const r = wrap.getBoundingClientRect();
+      const [x, z] = toWorld(e.clientX - r.left, e.clientY - r.top, r);
+      fCoord.textContent = `X ${Math.round(x)} Z ${Math.round(z)}`;
+      let best = null;
+      for (const [code, p] of Object.entries(app.data.postals || {})) {
+        const dd = Math.hypot(p.x - x, p.z - z);
+        if (!best || dd < best.dd) best = { code, dd };
+      }
+      fPostal.textContent = best && best.dd < 120 / ka() ? `Postal ${best.code}` : 'Postal --';
+      const hit = nearest(e);
+      canvas.title = hit ? hit.label : '';
+      canvas.style.cursor = hit ? 'pointer' : '';
+    });
+    new ResizeObserver(() => (autoFit ? fit() : draw())).observe(wrap);
+    let lastKey = '';
+    const redraw = () => { if (document.body.contains(el)) draw(); else mapDraws.delete(redraw); };
+    mapDraws.add(redraw);
+    app.updaters.push(() => {
+      if (!document.body.contains(el)) return;
+      routeTick();
+      const pts = points();
+      const k = JSON.stringify([pts.units.map((u) => [u.x, u.z, u.status, u.callsign]), pts.calls.map((x) => [x.c.id, x.p.x, x.p.z, x.c.priority, x.c.status]), pts.hazards.length, pts.tows.length, layers.players ? pts.players.map((p) => [p.x, p.z]) : 0, app.selectedCall, app.selectedUnit, app.data.mapCal]);
+      if (k === lastKey) return;
+      lastKey = k;
+      if (followBox.checked) centerOnMe();
+      else if (autoFit) fit();
+      else draw();
+    });
+    const api_ = {
+      el, fit, zoom, focusUnit, focusCall, draw, center,
+      reload: () => { layers.players = !prefs().hidePlayers; loadImage(); },
+    };
+    loadImage();
+    return api_;
+  }
+
+  function mapWindow(cls, opts = {}) {
+    const w = child('Live Map - ER:LC', { cls, ic: 'map' });
+    const view = mapView(opts);
+    w.body.replaceWith(view.el);
+    app.map = view;
+    return w.el;
+  }
+
+  // Full-screen live map in a dialog (for consoles without a map pane).
+  function mapDialog() {
+    if (app.map && document.body.contains(app.map.el) && !app.map.dialog) { app.map.fit(); return; }
+    const view = mapView();
+    view.dialog = true;
+    const prev = app.map;
+    app.map = view;
+    openDialog({ id: 'map', title: 'Live Map - ER:LC', width: Math.min(1100, innerWidth - 20), icon: 'map', content: h('div', { class: 'map-dialog' }, view.el), onClose: () => { app.map = prev; } });
+  }
+
+  // ---------- Lookup ----------
+
+  const LOOKUP_TYPES = { dispatcher: ['name', 'plate', 'serial'], police: ['name', 'plate', 'serial'], fire: ['name'], dot: ['plate'], law: ['name', 'plate', 'serial'] };
+  const LOOKUP_LABEL = { name: 'Name', plate: 'Plate', serial: 'Weapon Serial' };
+
+  function lookupPanel() {
+    const types = LOOKUP_TYPES[app.role] || ['name'];
+    let type = types[0];
+    let last = null;
+    const tabsEl = h('div', { class: 'tabs', style: 'padding:0' });
+    const input = h('input', { style: 'flex:1', maxlength: 60, class: 'mono' });
+    const results = h('div', { class: 'lookup-results' });
+    const setType = (t) => {
+      type = t;
+      tabsEl.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.t === t));
+      input.placeholder = t === 'name' ? 'First and last name' : t === 'plate' ? 'Plate number (10-28)' : 'Serial number';
+    };
+    for (const t of types) tabsEl.append(h('button', { class: 'tab', 'data-t': t, type: 'button', onclick: () => setType(t) }, LOOKUP_LABEL[t]));
+    const run = async (t, q, quiet) => {
+      if (t && types.includes(t)) setType(t);
+      if (q !== undefined && q !== null) input.value = q;
+      const query = input.value.trim();
+      if (query.length < 2) { if (!quiet) toast('Type at least 2 characters.', 'error'); return; }
+      last = { type, q: query };
+      try {
+        const { results: list } = await api(`/api/cad/search?type=${encodeURIComponent(type)}&q=${encodeURIComponent(query)}`);
+        renderResults(results, type, list, query);
+      } catch (err) {
+        if (!quiet) toast(err.message, 'error');
+      }
+    };
+    const el = h('div', { class: 'lookup' },
+      tabsEl,
+      h('form', { class: 'tab-page inline-form', style: 'margin:0', onsubmit: (e) => { e.preventDefault(); run(); } },
+        icon('lookup', 18), h('label', null, 'Search:'), input, h('button', { class: 'btn btn-default', type: 'submit' }, 'Run')),
+      results);
+    setType(type);
+    results.append(h('div', { class: 'term' }, h('div', { class: 'term-line' }, 'READY. ENTER A NAME, PLATE OR SERIAL AND PRESS RUN.')));
+    return { el, run, rerun: () => last && run(last.type, last.q, true), focus: () => input.focus() };
+  }
+
+  function openLookup(type, q) {
+    // MDTs with a Lookup tab switch to it instead of opening a window.
+    C.onLookupFocus?.();
+    if (app.lookup?.inline) {
+      if (q || type) app.lookup.run(type, q, !q);
+      app.lookup.focus();
+      return;
+    }
+    const existing = document.querySelector('[data-dialog=lookup]');
+    if (existing && app.lookup) {
+      if (q) app.lookup.run(type, q);
+      app.lookup.focus();
+      return;
+    }
+    const panel = lookupPanel();
+    app.lookup = panel;
+    const d = openDialog({ id: 'lookup', title: 'Lookup - NCIC / GCIC', width: 820, icon: 'lookup', content: panel.el, onClose: () => { if (app.lookup === panel) app.lookup = null; } });
+    d.body.parentElement.dataset.dialog = 'lookup';
+    if (q) panel.run(type, q);
+    else panel.focus();
+  }
+
+  // Terminal style return, like a 10-28 / 10-29 on a real MDT.
+  function termReturn(lines) {
+    return h('div', { class: 'term' }, lines.filter(Boolean).map(([text, cls]) => h('div', { class: `term-line ${cls || ''}` }, text)));
+  }
+  const hitBanner = (label, kind = 'red') => h('div', { class: `hit ${kind}` }, icon(kind === 'red' ? 'alert' : 'warning', 18), label);
+
+  function renderResults(box, type, list, q) {
+    const head = `${type === 'name' ? 'QW' : type === 'plate' ? 'RQ' : 'QG'} ${up(q)} - ${list.length} RECORD${list.length === 1 ? '' : 'S'} - ${stamp(Date.now())}`;
+    if (!list.length) {
+      box.replaceChildren(termReturn([[head], [`NO RECORD FOUND FOR ${up(q)}.`, 'miss'], ['CHECK SPELLING AND RE-RUN, OR RUN A DIFFERENT TYPE.']]));
+      return;
+    }
+    if (type === 'name') box.replaceChildren(termReturn([[head]]), ...list.map((p) => personCard(p)));
+    else if (type === 'plate') {
+      box.replaceChildren(termReturn([[head]]), ...list.map((r) => {
+        const v = r.vehicle;
+        const reg = v.registration || {};
+        const hits = [
+          v.stolen ? hitBanner(`*** STOLEN VEHICLE *** REPORTED ${stamp(v.stolenAt)} - DO NOT RELEASE, CONFIRM WITH DISPATCH`) : null,
+          r.bolos.length ? hitBanner(`*** BOLO ${r.bolos[0].num || ''} *** ${up(r.bolos[0].subject)}`, 'purple') : null,
+          (r.owner?.warrants || []).some((w) => w.status === 'active') ? hitBanner('*** REGISTERED OWNER HAS AN ACTIVE WARRANT ***') : null,
+          reg.status && reg.status !== 'valid' ? hitBanner(`REGISTRATION ${up(reg.status)}`, 'amber') : null,
+          v.insurance !== 'valid' ? hitBanner(`INSURANCE ${up(v.insurance)}`, 'amber') : null,
+          v.impounded ? hitBanner(`IMPOUNDED - ${up(v.impoundReason || '')}`, 'amber') : null,
+        ];
+        return h('div', null,
+          hits,
+          termReturn([
+            [`LIC/${v.plate}  VIN/${v.vin || 'UNKNOWN'}`],
+            [`VEH/${up(plateFmt(v)) || 'UNKNOWN'}`],
+            [`REG/${up(reg.status || 'none')}  EXP/${date(reg.expires) || '--'}  INS/${up(v.insurance)}`, reg.status === 'valid' && v.insurance === 'valid' ? 'ok' : 'warn'],
+            r.owner ? [`R/O ${up(r.owner.lastName)}, ${up(r.owner.firstName)}  DOB/${r.owner.dob || '--'}  ${up(r.owner.address || '')}`] : ['R/O NOT ON FILE', 'warn'],
+          ]),
+          h('div', { class: 'result' }, vehicleGrid([v])),
+          r.owner ? personCard(r.owner, 'REGISTERED OWNER') : null);
+      }));
+    } else {
+      box.replaceChildren(termReturn([[head]]), ...list.map((r) => h('div', null,
+        r.firearm.stolen ? hitBanner('*** STOLEN FIREARM ***') : null,
+        termReturn([[`SER/${r.firearm.serial}  TYP/${up(r.firearm.type)}  REG/${r.firearm.registered ? 'YES' : 'NO'}`, r.firearm.registered ? 'ok' : 'warn']]),
+        r.owner ? personCard(r.owner, 'REGISTERED OWNER') : null)));
+    }
+  }
+
+  const actionsCell = (...btns) => h('span', { class: 'acts' }, btns);
+
+  function vehicleGrid(list, actions) {
+    const canImpound = !actions && (app.role === 'dot' || app.role === 'police');
+    const canSuspend = !actions && (app.role === 'police' || app.role === 'law');
+    return h('div', { class: 'mini-grid' }, grid([
+      { label: 'Plate', render: (v) => v.plate },
+      { label: 'Vehicle', render: (v) => up(plateFmt(v)) },
+      { label: 'VIN', render: (v) => v.vin || '' },
+      { label: 'Reg', render: (v) => up(v.registration?.status), cls: (v) => `cell ${v.registration?.status === 'valid' ? 'st-available' : v.registration?.status === 'suspended' ? 'st-onscene' : 'st-pending'}` },
+      { label: 'Expires', render: (v) => date(v.registration?.expires) },
+      { label: 'Ins', render: (v) => up(v.insurance), cls: (v) => `cell ${v.insurance === 'valid' ? 'st-available' : 'st-pending'}` },
+      { label: 'Flags', render: (v) => [v.stolen ? 'STOLEN' : '', v.impounded ? 'IMPOUNDED' : '', v.source === 'ingame' ? 'AUTO-REG' : ''].filter(Boolean).join(' ') || '--', cls: (v) => (v.stolen ? 'tx-panic' : v.impounded ? 'tx-busy' : '') },
+      actions ? { label: '', render: actions } : null,
+      canSuspend || canImpound ? { label: '', render: (v) => actionsCell(
+        canSuspend && v.registration?.status !== 'suspended' ? btn('Suspend Reg', () => suspendRegDialog(v), 'btn-danger') : null,
+        app.role === 'law' && v.registration?.status !== 'valid' ? btn('Reinstate', () => act('setRegistration', { id: v.id, status: 'valid' }, 'Registration reinstated.')) : null,
+        canImpound ? (v.impounded ? btn('Release', () => act('impound', { id: v.id, impounded: false }, 'Vehicle released.')) : btn('Impound', () => impoundDialog(v))) : null,
+        app.role === 'police' ? btn('Tow', () => towRequestDialog({ plate: v.plate, vehicle: plateFmt(v) })) : null) } : null,
+    ], list, { empty: 'No vehicles.' }));
+  }
+
+  function suspendRegDialog(v) {
+    return confirmDialog('Suspend Registration', `Suspend the registration for ${v.plate} (${plateFmt(v)})? The owner will need the courts to reinstate it.`, 'Suspend', () => act('setRegistration', { id: v.id, status: 'suspended' }, `Registration for ${v.plate} suspended.`));
+  }
+
+  function firearmGrid(list, actions) {
+    return h('div', { class: 'mini-grid' }, grid([
+      { label: 'Serial', render: (f) => f.serial },
+      { label: 'Firearm', render: (f) => up(f.type) },
+      { label: 'Registered', render: (f) => (f.registered ? 'YES' : 'NO'), cls: (f) => `cell ${f.registered ? 'st-available' : 'st-pending'}` },
+      { label: 'Flags', render: (f) => (f.stolen ? 'STOLEN' : '--'), cls: (f) => (f.stolen ? 'tx-panic' : '') },
+      actions ? { label: '', render: actions } : null,
+    ], list, { empty: 'No firearms.' }));
+  }
+
+  const recordKind = (r) => (r.type === 'citation' && r.plate ? 'vehicle' : r.type);
+  const recordTypeCls = (r) => `cell ${r.type === 'arrest' ? 'st-onscene' : r.type === 'citation' ? 'st-pending' : 'st-unavailable'}`;
+  const expungeBtn = (r, who) => btn('Expunge', () => confirmDialog('Expunge Record', `Permanently expunge the ${r.type} for ${who || r.charges.join(', ')}?`, 'Expunge', () => act('expungeRecord', { id: r.id }, 'Record expunged.')), 'btn-danger');
+
+  function recordsGrid(list, withName) {
+    return h('div', { class: 'mini-grid', style: withName ? 'max-height:none' : '' }, grid([
+      { label: 'Date', render: (r) => stamp(r.at) },
+      withName ? { label: 'Subject', render: (r) => up(r.civName) } : null,
+      { label: 'Type', render: (r) => (recordKind(r) === 'vehicle' ? 'VEH CITE' : up(r.type)), cls: recordTypeCls },
+      { label: 'Charges', render: (r) => up(r.charges.join(', ')) },
+      { label: 'Plate', render: (r) => r.plate || '' },
+      { label: 'Fine', render: (r) => (r.fine ? money(r.fine) : '') },
+      { label: 'Jail', render: (r) => (r.jail ? `${r.jail} MO` : '') },
+      { label: 'Officer', render: (r) => up(r.officer) },
+      app.role === 'law' ? { label: '', render: (r) => expungeBtn(r, r.civName) } : null,
+    ], list, { empty: withName ? 'No records filed yet.' : 'No criminal or traffic history.' }));
+  }
+
+  function warrantsGrid(list, withName) {
+    const actions = (w) => actionsCell(
+      w.status === 'active' ? btn('Served', () => act('setWarrant', { id: w.id, status: 'served' }, 'Warrant served.')) : null,
+      w.status === 'active' && app.role === 'law' ? btn('Revoke', () => act('setWarrant', { id: w.id, status: 'revoked' }, 'Warrant revoked.'), 'btn-danger') : null,
+      w.status !== 'active' && app.role === 'law' ? btn('Reactivate', () => act('setWarrant', { id: w.id, status: 'active' }, 'Warrant reactivated.')) : null);
+    return h('div', { class: 'mini-grid', style: withName ? 'max-height:none' : '' }, grid([
+      { label: 'No.', render: (w) => w.num || '' },
+      { label: 'Issued', render: (w) => stamp(w.at) },
+      withName ? { label: 'Subject', render: (w) => up(w.civName) } : null,
+      { label: 'Type', render: (w) => `${up(w.type)} WARRANT` },
+      { label: 'Charges', render: (w) => up(w.charges) },
+      { label: 'Bond', render: (w) => (w.bond ? money(w.bond) : 'NO BOND') },
+      { label: 'Status', render: (w) => up(w.status), cls: (w) => `cell ${w.status === 'active' ? 'st-onscene' : 'st-unavailable'}` },
+      { label: 'By', render: (w) => up(w.issuedBy) },
+      app.role === 'police' || app.role === 'law' ? { label: '', render: actions } : null,
+    ], list, { empty: 'No warrants.' }));
+  }
+
+  function licensesGrid(p) {
+    const lic = p.licenses || {};
+    const canSuspend = app.role === 'police';
+    const canSet = app.role === 'law';
+    return h('div', { class: 'mini-grid' }, grid([
+      { label: 'License', render: (k) => up(LICENSE_NAMES[k]) },
+      { label: 'Status', render: (k) => up(lic[k]?.status || 'none'), cls: (k) => txClass(lic[k]?.status) },
+      { label: 'Number', render: (k) => lic[k]?.number || '' },
+      { label: 'Expires', render: (k) => date(lic[k]?.expires) },
+      { label: 'Note', render: (k) => up(lic[k]?.reason || '') },
+      canSuspend || canSet ? { label: '', render: (k) => actionsCell(
+        canSuspend && lic[k]?.status === 'valid' ? btn('Suspend', () => suspendLicenseDialog(p, k), 'btn-danger') : null,
+        canSet ? btn('Set…', () => setLicenseDialog(p, k)) : null) } : null,
+    ], LICENSE_KINDS, { key: (k) => k }));
+  }
+
+  function suspendLicenseDialog(p, kind) {
+    return formDialog({
+      title: `Suspend ${LICENSE_NAMES[kind]} License - ${up(p.lastName)}, ${up(p.firstName)}`,
+      submitLabel: 'Suspend License',
+      danger: true,
+      icon: 'license',
+      fields: [{ name: 'reason', label: 'Reason', wide: true, required: true, max: 160, placeholder: 'DUI, reckless driving, court order…' }],
+      onSubmit: (v) => act('setLicense', { civId: p.id, kind, status: 'suspended', reason: v.reason }, `${LICENSE_NAMES[kind]} license suspended.`),
+    });
+  }
+
+  function setLicenseDialog(p, kind) {
+    return formDialog({
+      title: `${LICENSE_NAMES[kind]} License - ${up(p.lastName)}, ${up(p.firstName)}`,
+      submitLabel: 'Save',
+      icon: 'license',
+      fields: [
+        { name: 'status', label: 'Status', type: 'select', value: p.licenses?.[kind]?.status || 'none', options: ['valid', 'pending', 'suspended', 'revoked', 'expired', 'none'].map((s) => [s, cap(s)]) },
+        { name: 'reason', label: 'Reason / note', wide: true, max: 160 },
+      ],
+      onSubmit: (v) => act('setLicense', { civId: p.id, kind, status: v.status, reason: v.reason }, 'License updated.'),
+    });
+  }
+
+  function personCard(p, heading) {
+    const active = (p.warrants || []).filter((w) => w.status === 'active');
+    const dl = p.licenses?.driver;
+    const actions = [];
+    if (app.role === 'police') {
+      actions.push(
+        btn('Citation', () => recordDialog(p, 'citation')),
+        btn('Vehicle Citation', () => recordDialog(p, 'citation', { vehicle: true })),
+        btn('Warning', () => recordDialog(p, 'warning')),
+        btn('Arrest', () => recordDialog(p, 'arrest'), 'btn-danger'),
+        dl?.status === 'valid' ? btn('Suspend DL', () => suspendLicenseDialog(p, 'driver'), 'btn-danger') : null,
+        btn('BOLO', () => boloDialog({ kind: 'person', subject: `${p.firstName} ${p.lastName}` })));
+    }
+    if (app.role === 'law') actions.push(btn('Issue Warrant', () => C.warrantDialog?.(p), 'btn-default'), C.adjustBalanceBtn?.(p));
+    return h('div', { class: 'result person' },
+      active.length ? hitBanner(`*** ${active.length} ACTIVE WARRANT${active.length > 1 ? 'S' : ''} *** ${up(active.map((w) => w.charges).join('; '))}`) : null,
+      (p.bolos || []).length ? hitBanner(`*** BOLO *** ${up(p.bolos[0].subject)}`, 'purple') : null,
+      p.armed ? hitBanner('CAUTION: KNOWN TO BE ARMED', 'amber') : null,
+      p.medicalAlert ? hitBanner(`MEDICAL ALERT${p.medical ? `: ${up(p.medical)}` : ''}`, 'amber') : null,
+      heading ? h('div', { class: 'card-head' }, heading) : null,
+      h('div', { class: 'person-top' },
+        p.mugshot ? h('img', { class: 'mug', src: p.mugshot, alt: '', referrerpolicy: 'no-referrer', onerror: (e) => e.target.replaceWith(h('div', { class: 'mug blank' }, icon('user', 40))) }) : h('div', { class: 'mug blank' }, icon('user', 40)),
+        h('div', { style: 'flex:1;min-width:0' },
+          h('h4', null, `${up(p.lastName)}, ${up(p.firstName)}`,
+            active.length ? flag('WANTED', 'red') : flag('NO WANTS', 'green'),
+            dl ? flag(`DL: ${up(dl.status)}`, licClass(dl.status)) : null,
+            p.licenses?.firearm && p.licenses.firearm.status !== 'none' ? flag(`CCW: ${up(p.licenses.firearm.status)}`, licClass(p.licenses.firearm.status)) : null),
+          h('div', { class: 'kv' }, [['DOB', p.dob], ['SEX', p.gender], ['HGT', p.height], ['WGT', p.weight], ['HAIR', p.hair], ['EYES', p.eyes], ['PHONE', p.phone], ['DL#', dl?.number], ['ADDRESS', p.address], ['OCC', p.occupation]].filter(([, v]) => v).map(([k, v]) => h('div', null, h('b', null, `${k}:`), up(v)))))),
+      p.licenses ? [h('div', { class: 'sec' }, 'Licenses'), licensesGrid(p)] : null,
+      p.vehicles?.length ? [h('div', { class: 'sec' }, `Vehicles (${p.vehicles.length})`), vehicleGrid(p.vehicles)] : null,
+      p.firearms?.length ? [h('div', { class: 'sec' }, `Firearms (${p.firearms.length})`), firearmGrid(p.firearms)] : null,
+      p.records ? [h('div', { class: 'sec' }, `Criminal / Traffic History (${p.records.length})`), recordsGrid(p.records)] : null,
+      p.warrants?.length ? [h('div', { class: 'sec' }, 'Warrants'), warrantsGrid(p.warrants)] : null,
+      actions.filter(Boolean).length ? h('div', { class: 'btnrow left' }, actions) : null);
+  }
+
+  function recordDialog(p, type, { vehicle = false } = {}) {
+    let inputs;
+    const charges = PENAL.filter((c) => (vehicle ? c[4] : true));
+    const picker = h('select', {
+      onchange: (e) => {
+        const c = charges[Number(e.target.value)];
+        e.target.value = '';
+        if (!c) return;
+        inputs.charges.value = (inputs.charges.value ? `${inputs.charges.value}\n` : '') + c[0];
+        if (inputs.fine) inputs.fine.value = String((Number(inputs.fine.value) || 0) + c[2]);
+        if (inputs.jail) inputs.jail.value = String((Number(inputs.jail.value) || 0) + c[3]);
+      },
+    }, h('option', { value: '' }, 'Add a charge from the penal code…'), charges.map((c, i) => h('option', { value: i }, `${c[0]} (${c[1]}) $${c[2]}${c[3] ? ` / ${c[3]} mo` : ''}`)));
+    const label = vehicle ? 'Vehicle Citation' : cap(type);
+    const plates = (p.vehicles || []).map((v) => v.plate);
+    inputs = formDialog({
+      title: `New ${label} - ${up(p.lastName)}, ${up(p.firstName)}`,
+      submitLabel: `File ${label}`,
+      danger: type === 'arrest',
+      width: 580,
+      icon: type === 'arrest' ? 'arrest' : 'citation',
+      intro: type === 'warning' ? null : 'Fines are charged to the character\'s bank balance.',
+      fields: [
+        { type: 'html', el: h('div', { class: 'frow' }, h('label', null, 'Penal code:'), picker) },
+        { name: 'charges', label: 'Charges (one per line)', type: 'textarea', required: true, max: 2000 },
+        vehicle ? { name: 'plate', label: 'Plate', required: true, max: 10, value: plates[0] || '', list: 'plates-dl' } : null,
+        vehicle ? { type: 'html', el: h('datalist', { id: 'plates-dl' }, plates.map((x) => h('option', { value: x }))) } : null,
+        type === 'warning' ? null : { name: 'fine', label: 'Fine ($)', type: 'number', min: 0, value: '' },
+        type === 'arrest' ? { name: 'jail', label: 'Jail (months)', type: 'number', min: 0, value: '' } : null,
+        { name: 'location', label: 'Location', value: app.data.myUnit ? [app.data.myUnit.postal ? `Postal ${app.data.myUnit.postal}` : '', app.data.myUnit.location].filter(Boolean).join(', ') : '', wide: true },
+        { name: 'notes', label: 'Narrative', type: 'textarea', max: 1000 },
+      ],
+      onSubmit: (v) => act('createRecord', { civId: p.id, type, charges: v.charges.split('\n'), plate: v.plate || '', fine: Number(v.fine) || 0, jail: Number(v.jail) || 0, location: v.location, notes: v.notes }, `${label} filed${Number(v.fine) ? `, ${money(Number(v.fine))} charged` : ''}.`),
+    });
+  }
+
+  function impoundDialog(v) {
+    return formDialog({
+      title: `Impound ${v.plate}`,
+      submitLabel: 'Impound',
+      icon: 'tow',
+      fields: [
+        { name: 'reason', label: 'Reason', type: 'select', wide: true, options: ['Parked illegally', 'Abandoned vehicle', 'Evidence hold', 'Unregistered', 'No insurance', 'Driver arrested', 'Blocking roadway', 'Wrecked / disabled', 'Stolen recovered'].map((x) => [x, x]) },
+        { name: 'hold', label: 'Hold', type: 'select', options: [['', 'No hold'], ['Evidence', 'Evidence hold'], ['Investigation', 'Investigative hold'], ['Owner notified', 'Release to owner']] },
+      ],
+      onSubmit: (val) => act('impound', { id: v.id, impounded: true, reason: val.reason, hold: val.hold }, 'Vehicle impounded.'),
+    });
+  }
+
+  // ---------- BOLOs ----------
+
+  function bolosDialog() {
+    const canWrite = app.role === 'dispatcher' || app.role === 'police';
+    liveDialog({ id: 'bolos', title: 'BOLOs - Be On the Lookout', width: 720, icon: 'bolo' }, (d) => d.bolos, (d) => {
+      const bolos = app.data.bolos || [];
+      d.setTitle(`BOLOs - ${bolos.length} Active`);
+      return [
+        canWrite ? h('div', { class: 'btnrow left', style: 'padding:0 0 6px' }, h('button', { class: 'btn', onclick: () => boloDialog() }, icon('bolo', 16), 'New BOLO…')) : null,
+        h('div', { class: 'ref-table', style: 'max-height:50vh' }, grid([
+          { label: 'No.', render: (b) => b.num || '' },
+          { label: 'Time', render: (b) => stamp(b.at) },
+          { label: 'Type', render: (b) => up(b.kind) },
+          { label: 'Subject', render: (b) => up(b.subject) },
+          { label: 'Plate', render: (b) => b.plate || '' },
+          { label: 'Details', render: (b) => up(b.details) },
+          { label: 'By', render: (b) => up(b.by) },
+          canWrite ? { label: '', render: (b) => btn('Clear', () => act('clearBolo', { id: b.id }, 'BOLO cleared.')) } : null,
+        ], bolos, { empty: 'No active BOLOs.' })),
+      ];
+    });
+  }
+
+  function boloDialog(preset = {}) {
+    return formDialog({
+      title: 'New Record - BOLO',
+      submitLabel: 'Broadcast BOLO',
+      icon: 'bolo',
+      intro: 'Every unit sees this BOLO, and plate or name lookups that match it show a hit.',
+      fields: [
+        { name: 'kind', label: 'Type', type: 'select', value: preset.kind || 'person', options: [['person', 'Person'], ['vehicle', 'Vehicle']] },
+        { name: 'plate', label: 'Plate', max: 10, value: preset.plate },
+        { name: 'subject', label: 'Subject', required: true, wide: true, value: preset.subject, placeholder: 'W/M, red hoodie / Black Falcon sedan' },
+        { name: 'details', label: 'Details', type: 'textarea', max: 500, value: preset.details },
+      ],
+      onSubmit: (v) => act('createBolo', v, 'BOLO broadcast.'),
+    });
+  }
+
+  // ---------- Reference and tools ----------
+
+  function tenCodesDialog() {
+    openDialog({ id: '10codes', title: '10-Codes', width: 560, icon: 'codes', content: h('div', null,
+      h('b', null, 'Radio codes'),
+      h('div', { class: 'ref-table', style: 'max-height:28vh;margin:4px 0 8px' }, grid([{ label: 'Code', render: (r) => r[0] }, { label: 'Meaning', render: (r) => up(r[1]) }], RADIO_CODES, { key: (r) => r[0] })),
+      h('b', null, 'Call types'),
+      h('div', { class: 'ref-table', style: 'max-height:30vh;margin-top:4px' }, grid([
+        { label: 'Code', render: (r) => r[0] },
+        { label: 'Call Type', render: (r) => up(r[1]) },
+        { label: 'Units', render: (r) => r[2].map((d) => up(ROLES[d].label)).join(', ') },
+        { label: 'Pri', render: (r) => `P${r[3]}` },
+      ], CALL_CODES, { key: (r) => r[0] }))) });
+  }
+
+  function penalDialog() {
+    const filter = h('input', { placeholder: 'Filter charges', style: 'width:100%' });
+    const box = h('div', { class: 'ref-table', style: 'margin-top:6px' });
+    const render = () => {
+      const q = filter.value.toLowerCase();
+      box.replaceChildren(grid([
+        { label: 'Charge', render: (r) => up(r[0]) },
+        { label: 'Class', render: (r) => up(CLASS_NAME[r[1]]), cls: (r) => (r[1] === 'F' ? 'tx-panic' : r[1] === 'M' ? 'tx-busy' : 'tx-available') },
+        { label: 'Fine', render: (r) => money(r[2]) },
+        { label: 'Jail', render: (r) => (r[3] ? `${r[3]} MO` : '--') },
+        { label: 'Vehicle', render: (r) => (r[4] ? 'YES' : '') },
+      ], PENAL.filter((r) => r[0].toLowerCase().includes(q)), { key: (r) => r[0] }));
+    };
+    filter.addEventListener('input', render);
+    render();
+    openDialog({ id: 'penal', title: 'Penal Codes - State of Georgia (RP)', width: 620, icon: 'penal', content: h('div', null, filter, box) });
+  }
+
+  function notepadDialog() {
+    const ta = h('textarea', { class: 'notepad', spellcheck: 'false' });
+    ta.value = store.get('gsrp_cad_notepad', false) || '';
+    ta.addEventListener('input', () => store.set('gsrp_cad_notepad', ta.value, false));
+    const stampBtn = btn('Insert Time', () => { ta.setRangeText(`[${clock(Date.now(), true)}] `, ta.selectionStart, ta.selectionEnd, 'end'); ta.dispatchEvent(new Event('input')); ta.focus(); });
+    openDialog({ id: 'notepad', title: 'Notepad', width: 500, icon: 'notepad', content: h('div', null, h('div', { class: 'btnrow left', style: 'padding:0 0 4px' }, stampBtn, btn('Clear', () => { ta.value = ''; ta.dispatchEvent(new Event('input')); })), ta, h('p', { class: 'muted' }, 'Saved in this browser only.')) });
+  }
+
+  const timers = [];
+  function timersDialog() {
+    const list = h('div');
+    const label = h('input', { placeholder: 'Label, e.g. 2041 traffic stop', style: 'flex:1' });
+    const mins = h('input', { type: 'number', min: 0, value: 5, style: 'width:56px' });
+    const render = () => {
+      list.replaceChildren(...(timers.length ? timers.map((t) => {
+        const left = t.end ? Math.max(0, Math.round((t.end - Date.now()) / 1000)) : null;
+        return h('div', { class: 'timer-row' },
+          h('span', { class: 't', style: left === 0 ? 'color:#c00000' : '' }, t.end ? `${pad(Math.floor(left / 60))}:${pad(left % 60)}` : age(t.start)),
+          h('span', { class: 'lbl' }, t.label || (t.end ? 'Countdown' : 'Stopwatch')),
+          btn('Remove', () => { timers.splice(timers.indexOf(t), 1); render(); }));
+      }) : [h('div', { class: 'empty' }, 'No timers. Add a countdown for status checks on long scenes.')]));
+    };
+    const add = (countdown) => {
+      timers.push({ label: label.value.trim(), start: Date.now(), end: countdown ? Date.now() + (Number(mins.value) || 0) * 60000 : null, rang: false });
+      label.value = '';
+      render();
+    };
+    openDialog({ id: 'timers', title: 'Timers', width: 460, icon: 'timers', content: h('div', null,
+      h('div', { class: 'inline-form', style: 'margin-bottom:8px' }, label, mins, h('span', null, 'min'), btn('Countdown', () => add(true)), btn('Stopwatch', () => add(false))),
+      list) });
+    const iv = setInterval(() => {
+      if (!document.body.contains(list)) { clearInterval(iv); return; }
+      for (const t of timers) if (t.end && !t.rang && Date.now() >= t.end) { t.rang = true; tone(TONES.attention); toast(`Timer done: ${t.label || 'countdown'}`); }
+      render();
+    }, 1000);
+    render();
+  }
+
+  function toneBoard() {
+    const b = (label, ic, seq) => h('button', { class: 'btn', onclick: () => tone(seq) }, icon(ic, 18), label);
+    openDialog({ id: 'tones', title: 'Tone Board', width: 380, icon: 'tones', content: h('div', { class: 'tone-grid' },
+      b('Alert Tone', 'tones', TONES.alert), b('Hi-Lo Evacuation', 'siren', TONES.hilo), b('Priority Tone', 'alert', TONES.priority),
+      b('Fire Station Tones', 'fire', TONES.fire), b('Attention (3 beeps)', 'info', TONES.attention), b('Panic / 10-33', 'siren', TONES.panic)) });
+  }
+
+  // ---------- Records management ----------
+
+  function recordsDialog() {
+    const tabs = [];
+    const d = app.data;
+    if (d.records) tabs.push(['Recent Records', () => recordsGrid(app.data.records || [], true)]);
+    if (d.warrants) tabs.push(['Active Warrants', () => warrantsGrid(app.data.warrants || [], true)]);
+    if (d.reports) tabs.push(['Reports', () => reportsGrid(app.data.reports || [])]);
+    if (d.impounds) tabs.push(['Impound Lot', () => impoundGrid(app.data.impounds || [])]);
+    if (d.bolos) tabs.push(['BOLOs', () => h('div', { class: 'mini-grid', style: 'max-height:none' }, grid([
+      { label: 'No.', render: (b) => b.num || '' }, { label: 'Time', render: (b) => stamp(b.at) }, { label: 'Subject', render: (b) => up(b.subject) }, { label: 'Plate', render: (b) => b.plate || '' }, { label: 'By', render: (b) => up(b.by) },
+    ], app.data.bolos || [], { empty: 'No active BOLOs.' }))]);
+    if (!tabs.length) return toast('No records for this console.', 'error');
+    let current = 0;
+    return liveDialog({ id: 'records', title: 'Records Management', width: 900, icon: 'records' },
+      (x) => [x.records, x.reports, x.warrants, x.impounds, x.bolos, current],
+      () => [
+        h('div', { class: 'btnrow left', style: 'padding:0 0 6px' },
+          UNIT_ROLES.includes(app.role) || isDispatch() ? h('button', { class: 'btn', onclick: reportDialog }, icon('report', 16), 'New Report…') : null,
+          isDispatch() || app.role === 'police' ? h('button', { class: 'btn', onclick: () => boloDialog() }, icon('bolo', 16), 'New BOLO…') : null),
+        tabStrip(tabs.map(([label], i) => [i, label]), current, (i) => { current = i; refreshNow(); }),
+        h('div', { class: 'tab-page', style: 'margin:0;max-height:60vh' }, tabs[current][1]()),
+      ]);
+  }
+
+  function reportsGrid(list) {
+    let open = null;
+    const box = h('div');
+    const render = () => {
+      box.replaceChildren(h('div', { class: 'mini-grid', style: 'max-height:40vh' }, grid([
+        { label: 'Date', render: (r) => stamp(r.at) },
+        { label: 'Dept', render: (r) => up(ROLES[r.dept]?.label || r.dept) },
+        { label: 'Type', render: (r) => up(r.kind) },
+        { label: 'Title', render: (r) => up(r.title) },
+        { label: 'Call', render: (r) => r.callNum || '' },
+        { label: 'By', render: (r) => up(r.by) },
+        { label: 'State', render: (r) => (r.submitted === false ? 'DRAFT' : 'FILED'), cls: (r) => (r.submitted === false ? 'tx-busy' : 'tx-available') },
+      ], list, { selected: open?.id, onSelect: (r) => { open = r; render(); }, empty: 'No reports filed yet.' })),
+      open ? h('div', { class: 'result', style: 'margin-top:6px;white-space:pre-wrap' }, h('b', null, `${open.title}${open.location ? ` - ${open.location}` : ''}`), '\n', open.body || 'No narrative.') : h('div', { class: 'empty' }, 'Click a report to read it.'));
+    };
+    render();
+    return box;
+  }
+
+  function impoundGrid(list) {
+    return h('div', { class: 'mini-grid', style: 'max-height:none' }, grid([
+      { label: 'Plate', render: (v) => v.plate },
+      { label: 'Vehicle', render: (v) => up(plateFmt(v)) },
+      { label: 'Owner', render: (v) => up(v.ownerName) },
+      { label: 'Reason', render: (v) => up(v.impoundReason) },
+      { label: 'Hold', render: (v) => up(v.impoundHold || 'NONE'), cls: (v) => (v.impoundHold ? 'tx-panic' : '') },
+      { label: 'By', render: (v) => up(v.impoundedBy) },
+      { label: 'Date', render: (v) => stamp(v.impoundedAt) },
+      app.role === 'dot' || app.role === 'police' ? { label: '', render: (v) => btn('Release', () => (v.impoundHold ? confirmDialog('Release Vehicle', `${v.plate} has a ${v.impoundHold} hold. Release it anyway?`, 'Release', () => act('impound', { id: v.id, impounded: false }, 'Vehicle released.')) : act('impound', { id: v.id, impounded: false }, 'Vehicle released.'))) } : null,
+    ], list, { empty: 'Impound lot is empty.' }));
+  }
+
+  const REPORT_KINDS = {
+    police: ['Incident report', 'Arrest report', 'Use of force', 'Collision report', 'Traffic stop'],
+    fire: ['EMS patient care', 'Rescue', 'Hazmat'],
+    dot: ['Tow / impound', 'Road closure', 'Road hazard', 'Collision cleanup'],
+    dispatcher: ['Dispatch log', 'Incident summary'],
+  };
+  function reportDialog() {
+    const kinds = REPORT_KINDS[app.role] || ['Report'];
+    const call = C.myOpenCall() || selectedCallObj();
+    return formDialog({
+      title: 'New Report',
+      submitLabel: 'File Report',
+      width: 580,
+      icon: 'report',
+      fields: [
+        { name: 'kind', label: 'Report type', type: 'select', options: kinds.map((k) => [k, k]) },
+        { name: 'callNum', label: 'Call #', value: call ? String(call.num) : '', max: 10 },
+        { name: 'title', label: 'Title', required: true, wide: true, max: 120, value: call ? `${callCode(call)} ${callTitle(call)}`.trim() : '' },
+        { name: 'location', label: 'Location', wide: true, value: call?.location || app.data.myUnit?.location || '' },
+        { name: 'body', label: 'Narrative', type: 'textarea', rows: 8, max: 4000 },
+      ],
+      onSubmit: (v) => act('createReport', v, 'Report filed.'),
+    });
+  }
+
+  // ---------- Messages ----------
+
+  function messageTargets() {
+    const t = [['all', 'All units (broadcast)'], ['dispatch', 'Dispatch']];
+    for (const d of UNIT_ROLES) t.push([`dept:${d}`, `All ${ROLES[d].label}`]);
+    for (const u of app.data.units || []) if (u.userId !== me()) t.push([u.userId, `${u.callsign} - ${u.name}`]);
+    for (const d of app.data.dispatch || []) if (d.userId !== me()) t.push([d.userId, `${d.callsign} - ${d.name} (dispatch)`]);
+    return t;
+  }
+  function sendMessageDialog(to) {
+    return formDialog({
+      title: 'Send Message',
+      submitLabel: 'Send',
+      icon: 'messages',
+      fields: [
+        { name: 'to', label: 'To', type: 'select', wide: true, value: to || (isDispatch() ? 'all' : 'dispatch'), options: messageTargets() },
+        { name: 'text', label: 'Message', type: 'textarea', required: true, max: 500, rows: 3 },
+      ],
+      onSubmit: (v) => act('sendMessage', v, 'Message sent.'),
+    });
+  }
+  function targetLabel(m) {
+    if (m.toId === 'all') return 'ALL';
+    if (m.toId === 'dispatch') return 'DISPATCH';
+    if (m.toId?.startsWith('dept:')) return up(ROLES[m.toId.slice(5)]?.label);
+    if (m.toId === me()) return 'ME';
+    const u = (app.data.units || []).find((x) => x.userId === m.toId) || (app.data.dispatch || []).find((x) => x.userId === m.toId);
+    return u ? u.callsign : 'UNIT';
+  }
+  // A message thread panel; returns an element that updates itself.
+  function messagesPanel() {
+    const list = h('div', { class: 'msg-list' });
+    const input = h('input', { placeholder: 'Message dispatch (Enter to send)', maxlength: 500, style: 'flex:1' });
+    const to = h('select', { style: 'max-width:170px' });
+    const fillTargets = () => {
+      const cur = to.value || (isDispatch() ? 'all' : 'dispatch');
+      to.replaceChildren(...messageTargets().map(([v, l]) => h('option', { value: v, selected: v === cur }, l)));
+    };
+    bind(list, (d) => [(d.messages || []).map((m) => m.id), (d.units || []).length], () => {
+      fillTargets();
+      const msgs = app.data.messages || [];
+      const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 10;
+      setTimeout(() => { if (atBottom || !list.dataset.seen) list.scrollTop = list.scrollHeight; list.dataset.seen = '1'; }, 0);
+      return msgs.length ? msgs.map((m) => h('div', { class: `msg ${m.fromId === me() ? 'out' : 'in'} ${m.urgent ? 'urgent' : ''}` },
+        h('div', { class: 'msg-meta' }, `${clock(m.at)} ${m.from} to ${targetLabel(m)}`),
+        h('div', { class: 'msg-text' }, m.text))) : [h('div', { class: 'empty' }, 'No messages yet.')];
+    });
+    const form = h('form', { class: 'inline-form', onsubmit: (e) => {
+      e.preventDefault();
+      if (!input.value.trim()) return;
+      act('sendMessage', { to: to.value, text: input.value }).then((ok) => { if (ok) input.value = ''; });
+    } }, to, input, h('button', { class: 'btn', type: 'submit' }, 'Send'));
+    return h('div', { class: 'messages' }, list, form);
+  }
+  function messagesDialog() {
+    openDialog({ id: 'messages', title: 'Messages', width: 560, icon: 'messages', content: messagesPanel() });
+  }
+
+  // ---------- Tows, hazards and backup (shared by police, fire, dispatch, DOT) ----------
+
+  function towRequestDialog(preset = {}) {
+    const call = C.myOpenCall() || selectedCallObj();
+    return formDialog({
+      title: 'Request Tow',
+      submitLabel: 'Send to DOT',
+      icon: 'tow',
+      width: 520,
+      intro: 'DOT units get the request on their MDT. Stolen vehicles get an evidence hold automatically.',
+      fields: [
+        { name: 'plate', label: 'Plate', value: preset.plate, max: 10 },
+        { name: 'vehicle', label: 'Vehicle', value: preset.vehicle, max: 60, placeholder: '2018 Black Falcon' },
+        { name: 'reason', label: 'Reason', type: 'select', options: ['Disabled vehicle', 'Collision', 'Arrest tow', 'Abandoned', 'Illegally parked', 'Evidence', 'Stolen recovered'].map((x) => [x, x]) },
+        { name: 'destination', label: 'Destination', type: 'select', options: ['County impound lot', 'Owner\'s residence', 'Repair shop', 'Evidence garage'].map((x) => [x, x]) },
+        { name: 'location', label: 'Location', value: call?.location || app.data.myUnit?.location || '', max: 120 },
+        { name: 'postal', label: 'Postal', value: call?.postal || app.data.myUnit?.postal || '', max: 10 },
+        { name: 'condition', label: 'Condition', wide: true, max: 120, placeholder: 'Front end damage, not drivable' },
+        { name: 'hold', label: 'Hold', type: 'select', options: [['', 'No hold'], ['Evidence hold. Do not release.', 'Evidence hold'], ['Investigative hold', 'Investigative hold']] },
+      ],
+      onSubmit: async (v) => {
+        const res = await act('requestTow', { ...v, callId: call?.id || null });
+        if (res?.num) toast(`Tow ${res.num} sent to DOT.`, 'ok');
+        return res;
+      },
+    });
+  }
+
+  const HAZARDS = ['Debris in roadway', 'Disabled vehicle', 'Collision cleanup', 'Fluid spill', 'Pothole / road damage', 'Downed tree', 'Downed power lines', 'Flooding', 'Signal outage', 'Animal in roadway', 'Construction'];
+  function hazardDialog(existing) {
+    const x = existing || {};
+    const unit = app.data.myUnit;
+    const ctl = x.controls || {};
+    return formDialog({
+      title: existing ? `Road Hazard ${x.num}` : 'Report Road Hazard',
+      submitLabel: existing ? 'Update Hazard' : 'Create Hazard',
+      icon: 'hazard',
+      width: 600,
+      intro: existing ? null : 'A new hazard opens a 10-92 call for DOT and shows on every live map.',
+      fields: [
+        { name: 'hazard', label: 'Hazard', type: 'select', value: x.hazard, options: HAZARDS.map((v) => [v, v]) },
+        { name: 'direction', label: 'Direction', type: 'select', value: x.direction, options: ['', 'Northbound', 'Southbound', 'Eastbound', 'Westbound', 'Both directions'].map((v) => [v, v || '--']) },
+        { name: 'lanes', label: 'Lanes', type: 'select', value: x.lanes, options: ['', 'Shoulder', '1 lane blocked', '2 lanes blocked', 'All lanes closed'].map((v) => [v, v || '--']) },
+        { name: 'estClear', label: 'Est. clear (min)', type: 'number', min: 0, value: x.estClear },
+        { name: 'location', label: 'Location', value: x.location ?? unit?.location ?? '', max: 120 },
+        { name: 'postal', label: 'Postal', value: x.postal ?? unit?.postal ?? '', max: 10 },
+        { type: 'html', el: h('b', null, 'Traffic control') },
+        { name: 'c_cones', label: 'Cones deployed', type: 'checkbox', value: ctl.cones },
+        { name: 'c_closure', label: 'Lane closure set', type: 'checkbox', value: ctl.closure },
+        { name: 'c_flagger', label: 'Flagger on scene', type: 'checkbox', value: ctl.flagger },
+        { name: 'c_arrow', label: 'Arrow board', type: 'checkbox', value: ctl.arrow },
+        { name: 'c_detour', label: 'Detour posted', type: 'checkbox', value: ctl.detour },
+        { name: 'c_broadcast', label: 'Broadcast to all units', type: 'checkbox', value: existing ? false : true },
+        { name: 'notes', label: 'Notes', type: 'textarea', value: x.notes, max: 1000 },
+      ],
+      onSubmit: (v) => act('saveHazard', {
+        id: x.id, hazard: v.hazard, direction: v.direction, lanes: v.lanes, estClear: v.estClear, location: v.location, postal: v.postal, notes: v.notes,
+        controls: { cones: v.c_cones, closure: v.c_closure, flagger: v.c_flagger, arrow: v.c_arrow, detour: v.c_detour, broadcast: v.c_broadcast },
+      }, existing ? 'Hazard updated.' : 'Hazard reported.'),
+    });
+  }
+
+  function backupDialog() {
+    if (!app.data.myUnit) return toast('Clock in first.', 'error');
+    const b = (code, label, cls) => h('button', { class: `btn backup-btn ${cls}`, onclick: async () => { const ok = await act('requestBackup', { code }, `Backup requested, code ${code}.`); if (ok) d.close(); } }, h('b', null, `Code ${code}`), h('small', null, label));
+    const d = openDialog({ id: 'backup', title: 'Request Backup', width: 420, icon: 'backup', modal: true, content: h('div', null,
+      h('p', null, 'Every unit and dispatcher gets an urgent message with your location.'),
+      h('div', { class: 'backup-grid' }, b('1', 'No lights or siren', ''), b('2', 'Lights only', 'amber'), b('3', 'Lights and siren', 'red'))) });
+  }
+
+  function panicConfirm() {
+    if (!app.data.myUnit) return toast('Clock in first.', 'error');
+    if (app.data.myUnit.status === 'panic') return toast('Your panic is already active. Dispatch is responding.', 'error');
+    return confirmDialog('Emergency - 10-33', 'Activate your panic button? Every unit and dispatcher is alerted and a 10-33 call is created at your location.', 'Activate Panic', () => act('setStatus', { status: 'panic' }));
+  }
+
+  // ---------- Clock in (units) ----------
+
+  function logOnDialog() {
+    const role = app.role;
+    const g = app.data.ingame || {};
+    const last = app.data.shifts?.find((s) => s.dept === role);
+    const agencies = AGENCIES[role] || [];
+    return formDialog({
+      id: 'logon',
+      title: `Clock In - ${ROLES[role].title}`,
+      submitLabel: 'Clock In (10-41)',
+      icon: 'clockin',
+      width: 470,
+      intro: g.detected ? `Found you in game as ${g.player.name}. Your location updates by itself.` : 'Join the ER:LC server so the CAD can track your location. You are logged off after 20 minutes out of the server.',
+      fields: [
+        { name: 'callsign', label: 'Callsign', value: app.data.myUnit?.callsign || g.player?.callsign || last?.callsign || '', required: true, max: 12, placeholder: role === 'fire' ? 'E21' : role === 'dot' ? 'T-4' : '2A-41' },
+        { name: 'agency', label: 'Agency', type: 'select', value: app.data.myUnit?.agency, options: agencies.map(([name]) => [name, name]) },
+        { name: 'rank', label: role === 'police' ? 'Rank' : 'Unit type', type: 'select', value: app.data.myUnit?.rank, options: RANKS[role].map((r) => [r, r]) },
+        role === 'fire' ? { name: 'apparatus', label: 'Apparatus', value: app.data.myUnit?.apparatus || '', max: 40, placeholder: 'Engine 21' } : null,
+        role !== 'police' ? { name: 'crew', label: 'Crew', value: app.data.myUnit?.crew || '', max: 120, wide: true, placeholder: 'Names of your crew' } : null,
+      ],
+      onSubmit: (v) => act('goOnDuty', v, `Clocked in as ${v.callsign.toUpperCase()} (10-41).`),
+    });
+  }
+
+  function locationDialog() {
+    const u = app.data.myUnit;
+    if (!u) return toast('Clock in first.', 'error');
+    return formDialog({
+      title: 'Set Location',
+      submitLabel: 'Update',
+      icon: 'pin',
+      intro: app.data.ingame?.detected ? 'You are in game, so your location updates by itself. A typed location wins for 5 minutes.' : 'Not detected in game. Type where you are.',
+      fields: [
+        { name: 'location', label: 'Location', value: u.location, wide: true, max: 120 },
+        { name: 'postal', label: 'Postal', value: u.postal, max: 10 },
+      ],
+      onSubmit: (v) => act('setLocation', v, 'Location updated.'),
+    });
+  }
+
+  Object.assign(C, {
+    setRoute, clearRoute, routeToCall, myPos,
+    btn, need, callCode, onCall, plateFmt, myCalls, visibleCalls, callsWindow, unitsWindow, setSelectedUnit, emergencyLines, answerCall, answerFirstLine, importCall,
+    emergencyWindow, mergeDialog, textCallerDialog, callPos, suggestedUnits, suggestedBox, viewerWindow, newCallDialog, assignDialog, detachDialog,
+    noteDialog, closeCallDialog, callCard, getCallDialog, callHistoryDialog, mapView, mapWindow, mapDialog, lookupPanel, openLookup, renderResults,
+    termReturn, hitBanner, vehicleGrid, firearmGrid, recordsGrid, warrantsGrid, licensesGrid, personCard, recordDialog, impoundDialog, suspendLicenseDialog,
+    setLicenseDialog, suspendRegDialog, bolosDialog, boloDialog, tenCodesDialog, penalDialog, notepadDialog, timersDialog, toneBoard, recordsDialog, reportsGrid,
+    impoundGrid, reportDialog, sendMessageDialog, messagesPanel, messagesDialog, towRequestDialog, hazardDialog, HAZARDS, backupDialog, panicConfirm,
+    logOnDialog, locationDialog, actionsCell, recordKind, distLabel,
+  });
+})();

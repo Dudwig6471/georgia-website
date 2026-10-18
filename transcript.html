@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Georgia State Roleplay</title>
+  <meta name="description" content="Georgia State Roleplay is a community roleplay server set in the Peach State. Join us on Discord.">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="nav">
+    <div class="container nav-inner">
+      <a class="brand" href="#">
+        <span class="brand-mark"><img src="assets/logo.webp" alt="" width="40" height="40"></span>
+        <span class="brand-name">Georgia State Roleplay</span>
+      </a>
+      <nav class="nav-links">
+        <a href="#about">About</a>
+        <a href="/departments">Departments</a>
+        <a href="/cad">CAD</a>
+        <!-- TODO: replace with the real Discord invite link -->
+        <a class="btn btn-small" href="#" data-discord-invite>Join Discord</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="container hero-inner">
+        <div class="hero-text">
+          <p class="eyebrow">Welcome to</p>
+          <h1>Georgia State <span>Roleplay</span></h1>
+          <p class="lead">
+            A serious, friendly roleplay community set across the Peach State.
+            Patrol the highways, run a business, or keep the streets safe.
+            Your story starts here.
+          </p>
+          <div class="hero-actions">
+            <a class="btn" href="#" data-discord-invite>Join our Discord</a>
+            <a class="btn btn-outline" href="#about">Learn more</a>
+          </div>
+        </div>
+        <div class="hero-logo">
+          <img src="assets/logo.webp" alt="Georgia State Roleplay logo" width="320" height="320">
+        </div>
+      </div>
+    </section>
+
+    <section id="about" class="section">
+      <div class="container">
+        <h2>Why play with us</h2>
+        <div class="cards">
+          <article class="card">
+            <h3>Realistic roleplay</h3>
+            <p>Structured scenes, fair rules and active staff keep every session immersive.</p>
+          </article>
+          <article class="card">
+            <h3>Active community</h3>
+            <p>Regular sessions, events and a welcoming Discord full of people to play with.</p>
+          </article>
+          <article class="card">
+            <h3>Built-in Discord bot</h3>
+            <p>Our own bot handles applications, sessions and server info right inside Discord.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="departments" class="section section-tint">
+      <div class="container">
+        <h2>Departments</h2>
+        <ul class="dept-list">
+          <li><a href="/departments#fcso">Fulton County Sheriff's Office</a></li>
+          <li><a href="/departments#gsp">Georgia State Patrol</a></li>
+          <li><a href="/departments#sffr">South Fulton Fire &amp; Rescue</a></li>
+        </ul>
+        <p class="section-more"><a class="btn btn-outline" href="/departments">Departments &amp; server status</a></p>
+      </div>
+    </section>
+
+    <section class="cta">
+      <div class="container cta-inner">
+        <h2>Ready to roll?</h2>
+        <p>Join the Discord to get verified and hop into your first session.</p>
+        <a class="btn btn-light" href="#" data-discord-invite>Join our Discord</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <p>&copy; <span id="year">2026</span> Georgia State Roleplay. Not affiliated with the State of Georgia.</p>
+    </div>
+  </footer>
+
+  <script>
+    document.getElementById('year').textContent = new Date().getFullYear();
+  </script>
+</body>
+</html>

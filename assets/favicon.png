@@ -1,0 +1,10 @@
+# Georgia State Roleplay website
+
+Static home page (plain HTML + CSS, no build step). Open `index.html` in a browser or serve the folder with any static host.
+
+- Theme: blue background (`#0072FB`, `--blue` in `styles.css`) with white text and buttons
+- Discord invite: replace `href="#"` on every `data-discord-invite` link in `index.html`
+
+## CAD (`/cad`)
+
+`cad.html` and `cad.css` are the CAD. `cad.js` is the core (sign-in, window chrome, menus, polling); `cad-shared.js` holds calls, units, the live ER:LC map, lookups and records; `cad-dispatch.js`, `cad-mdt.js` (police, fire and DOT), `cad-civ.js` and `cad-law.js` are the consoles. Sign in is Discord OAuth, and all data lives in the bot (`bot/src/cad.js`), reached through the `/api/auth/*` and `/api/cad/*` rewrites in `vercel.json`. Setup: put `DISCORD_CLIENT_SECRET` in the bot's `.env` and add `https://gsrp.lol/api/auth/callback` under OAuth2 > Redirects in the Discord Developer Portal.

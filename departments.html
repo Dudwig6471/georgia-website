@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CAD · Georgia State Roleplay</title>
+  <meta name="description" content="Georgia State Roleplay computer aided dispatch. Sign in with Discord.">
+  <meta name="robots" content="noindex">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="stylesheet" href="cad.css?v=9">
+</head>
+<body>
+  <div class="loader" id="loader" role="status" aria-live="polite">
+    <div class="loader-logo">
+      <img class="loader-logo-base" src="assets/gs-logo.png" alt="" width="180" height="180">
+      <span class="loader-logo-shine" aria-hidden="true"></span>
+    </div>
+    <div class="loader-bar"><span></span></div>
+    <p class="loader-text">Loading CAD…</p>
+  </div>
+
+  <div id="app" class="app" hidden></div>
+  <div id="modal-root"></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="cad.js?v=9"></script>
+  <script src="cad-shared.js?v=9"></script>
+  <script src="cad-dispatch.js?v=9"></script>
+  <script src="cad-mdt.js?v=9"></script>
+  <script src="cad-civ.js?v=9"></script>
+  <script src="cad-law.js?v=9"></script>
+</body>
+</html>

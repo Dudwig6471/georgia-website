@@ -1,0 +1,574 @@
+// GSRP CAD unit MDTs for police (LEO), Fire/EMS and DOT. Two layouts: a
+// tabbed MDT (My Call, Calls, Lookup…) and the classic four pane board.
+(() => {
+  'use strict';
+
+  const C = window.CAD;
+  const {
+    app, ROLES, STATUS, SETTABLE, STATUS_COLOR, h, icon, act, toast, bind, tool, sep, shell, fileMenu, toolsMenu, helpMenu, formDialog, openDialog,
+    confirmDialog, refreshNow, grid, tabStrip, group, frow, clock, stamp, since, up, flag, isOpen, callTitle, statusText, agencyShort, selectCall, prefs, setPrefs,
+  } = C;
+
+  const me = () => app.me.user.id;
+  const btn = (...a) => C.btn(...a);
+
+  const TABS = {
+    police: [['mycall', 'My Call'], ['calls', 'Calls'], ['lookup', 'Lookup'], ['records', 'Records'], ['bolos', 'BOLOs'], ['units', 'Units'], ['messages', 'Messages'], ['history', 'History']],
+    fire: [['mycall', 'My Call'], ['calls', 'Calls'], ['patients', 'Patients'], ['firereports', 'Fire Reports'], ['units', 'Units'], ['messages', 'Messages'], ['history', 'History']],
+    dot: [['mycall', 'My Call'], ['calls', 'Calls'], ['tows', 'Tow Requests'], ['hazards', 'Road Hazards'], ['impound', 'Impound Lot'], ['lookup', 'Plate Lookup'], ['units', 'Units'], ['messages', 'Messages'], ['history', 'History']],
+  };
+
+  // ---------- Top bar: unit, status, actions, panic ----------
+
+  function trafficStopDialog() {
+    if (!app.data.myUnit) return toast('Clock in first.', 'error');
+    const u = app.data.myUnit;
+    return formDialog({
+      title: 'Traffic Stop (10-11)',
+      submitLabel: 'Start Traffic Stop',
+      icon: 'trafficstop',
+      intro: 'Creates a self-initiated 10-11 call at your location and runs the plate.',
+      fields: [
+        { name: 'plate', label: 'Plate', max: 10, placeholder: 'ABC1234' },
+        { name: 'postal', label: 'Postal', value: u.postal, max: 10 },
+        { name: 'location', label: 'Location', value: u.location, wide: true, max: 120 },
+        { name: 'details', label: 'Vehicle / reason', type: 'textarea', rows: 2, max: 500, placeholder: 'Black Falcon, speeding 85 in a 55' },
+      ],
+      onSubmit: async (v) => {
+        const res = await act('createCall', { code: '10-11', nature: 'Traffic Stop', priority: 3, depts: ['police'], location: v.location, postal: v.postal, details: v.details, plate: v.plate }, 'Traffic stop started.');
+        if (res && v.plate) C.openLookup('plate', v.plate);
+        return res;
+      },
+    });
+  }
+
+  function mutualAidDialog() {
+    if (!app.data.myUnit) return toast('Clock in first.', 'error');
+    const call = C.myOpenCall();
+    return formDialog({
+      title: 'Request Mutual Aid',
+      submitLabel: 'Send Request',
+      icon: 'mutualaid',
+      fields: [
+        { name: 'need', label: 'Request', type: 'select', options: ['Additional engine', 'Ladder / truck', 'Medic unit (ALS)', 'Rescue', 'Water tender', 'Hazmat team', 'Air ambulance', 'Law enforcement for scene security'].map((x) => [x, x]) },
+        { name: 'count', label: 'How many', type: 'select', options: [['1', '1'], ['2', '2'], ['3', '3+']] },
+        { name: 'notes', label: 'Notes', wide: true, max: 200 },
+      ],
+      onSubmit: async (v) => {
+        const u = app.data.myUnit;
+        const line = `${u.callsign} requests mutual aid: ${v.count} x ${v.need}${call ? ` for #${call.num}` : ''}${u.postal ? ` at postal ${u.postal}` : ''}.${v.notes ? ` ${v.notes}` : ''}`;
+        const ok = await act('sendMessage', { to: 'all', text: line }, 'Mutual aid requested.');
+        if (ok && call) await act('addNote', { id: call.id, text: `Mutual aid requested: ${v.count} x ${v.need}.` });
+        return ok;
+      },
+    });
+  }
+
+  const ROLE_ACTIONS = {
+    police: () => [
+      h('button', { class: 'mdt-act', onclick: trafficStopDialog }, icon('trafficstop', 22), 'Traffic Stop'),
+      h('button', { class: 'mdt-act', onclick: C.backupDialog }, icon('backup', 22), 'Backup'),
+    ],
+    fire: () => [
+      h('button', { class: 'mdt-act', onclick: mutualAidDialog }, icon('mutualaid', 22), 'Mutual Aid'),
+      h('button', { class: 'mdt-act', onclick: () => C.towRequestDialog() }, icon('tow', 22), 'Request Tow'),
+    ],
+    dot: () => [
+      h('button', { class: 'mdt-act', onclick: () => C.hazardDialog() }, icon('hazard', 22), 'Report Hazard'),
+      h('button', { class: 'mdt-act', onclick: C.backupDialog }, icon('backup', 22), 'Assist'),
+    ],
+  };
+
+  function topbar() {
+    const bar = h('div', { class: `mdt-top role-${app.role}` });
+    bind(bar, (d) => [d.myUnit && [d.myUnit.callsign, d.myUnit.status, d.myUnit.rank, d.myUnit.agency, d.myUnit.postal, d.myUnit.location], C.myOpenCall()?.num, d.ingame?.detected], () => {
+      const u = app.data.myUnit;
+      if (!u) {
+        return [
+          h('div', { class: 'unit-badge off' }, icon('power', 28), h('div', null, h('b', null, 'OFF DUTY'), h('small', null, `${ROLES[app.role].title} · ${app.me.user.name}`))),
+          h('button', { class: 'mdt-act big', onclick: C.logOnDialog }, icon('clockin', 22), 'Clock In'),
+          h('span', { class: 'grow' }),
+        ];
+      }
+      const call = C.myOpenCall();
+      return [
+        h('div', { class: 'unit-badge' }, icon(app.role === 'fire' ? 'fire' : app.role === 'dot' ? 'cone' : 'units', 28),
+          h('div', null, h('b', null, u.callsign), h('small', null, `${up(u.rank || '')} ${up(u.name)} · ${agencyShort(u)}`))),
+        h('div', { class: 'st-display', style: `--st:${STATUS_COLOR[u.status]}` },
+          h('b', null, STATUS[u.status].code), h('small', null, up(STATUS[u.status].label)),
+          h('small', { class: 'loc' }, u.postal ? `POSTAL ${u.postal}` : app.data.ingame?.detected ? 'IN GAME' : 'NOT IN GAME')),
+        h('div', { class: 'st-buttons' }, SETTABLE[app.role].map((s) => h('button', {
+          class: `st-btn ${u.status === s ? 'on' : ''}`, style: `--st:${STATUS_COLOR[s]}`, title: STATUS[s].label,
+          onclick: () => act('setStatus', { status: s }, `${STATUS[s].code} ${STATUS[s].label}.`),
+        }, h('b', null, STATUS[s].code), h('small', null, STATUS[s].short)))),
+        h('div', { class: 'mdt-actions' }, ROLE_ACTIONS[app.role]()),
+        call ? h('button', { class: 'mdt-call', onclick: () => showTab('mycall'), title: 'Open my call' }, h('b', null, `#${call.num}`), h('small', null, up(callTitle(call)).slice(0, 22))) : null,
+        h('span', { class: 'grow' }),
+        h('button', { class: `panic-btn ${u.status === 'panic' ? 'on' : ''}`, onclick: C.panicConfirm, title: 'Panic button (10-33)' }, icon('siren', 26), h('b', null, u.status === 'panic' ? 'PANIC ON' : 'PANIC')),
+      ];
+    });
+    return bar;
+  }
+
+  // ---------- Tabbed layout ----------
+
+  let showTab = () => {};
+
+  function myCallPage() {
+    const box = h('div', { class: 'mycall' });
+    let noteInput;
+    bind(box, (d) => {
+      const c = C.myOpenCall();
+      return [c && [c.id, c.status, c.units, c.notes.length, c.details, c.location, c.postal, c.priority], d.myUnit?.status, !c && (d.calls || []).filter((x) => isOpen(x) && x.depts.includes(app.role)).map((x) => [x.id, x.status, x.units.length])];
+    }, () => {
+      const u = app.data.myUnit;
+      const c = C.myOpenCall();
+      if (!u) return h('div', { class: 'empty big' }, icon('power', 40), 'You are off duty. Clock in to get calls.', h('button', { class: 'btn btn-default', onclick: C.logOnDialog }, 'Clock In'));
+      if (!c) {
+        const waiting = (app.data.calls || []).filter((x) => isOpen(x) && x.depts.includes(app.role)).sort((a, b) => a.priority - b.priority || a.at - b.at);
+        return [
+          h('div', { class: 'empty big' }, icon('check', 40), 'No assigned call. Dispatch will send you one, or attach to a call below.'),
+          waiting.length ? group(`Open ${ROLES[app.role].label} calls (${waiting.length})`, h('div', { class: 'mini-grid' }, grid([
+            { label: 'ID', render: (x) => String(x.num) },
+            { label: 'Pri', render: (x) => `P${x.priority}` },
+            { label: 'Call', render: (x) => up(`${x.code || ''} ${callTitle(x)}`.trim()) },
+            { label: 'Address', render: (x) => `${x.postal ? `${x.postal} ` : ''}${up(x.location)}` },
+            { label: 'Units', render: (x) => x.units.map((y) => y.callsign).join(' ') || '--' },
+            { label: 'Age', render: (x) => since(x.at) },
+            { label: '', render: (x) => btn('Attach', () => act('attach', { id: x.id }, `Attached to #${x.num}.`)) },
+          ], waiting))) : null,
+        ];
+      }
+      noteInput = h('input', { placeholder: 'Add a note to the call (Enter)', maxlength: 500, style: 'flex:1' });
+      const step = (s, label) => h('button', { class: `btn step ${u.status === s ? 'pressed' : ''}`, style: `--st:${STATUS_COLOR[s]}`, onclick: () => act('setStatus', { status: s }) }, label);
+      return [
+        h('div', { class: `call-head p${c.priority}` },
+          h('div', { class: 'num' }, `#${c.num}`),
+          h('div', { class: 'ttl' }, h('b', null, up(`${c.code || ''} ${callTitle(c)}`.trim())), h('small', null, `${C.PRIORITY_NAME[c.priority]} · ${C.SOURCE[c.source] || 'DISPATCH'} · RECEIVED ${clock(c.at)} (`, since(c.at), ')')),
+          h('div', { class: 'where' }, h('b', null, c.postal ? `POSTAL ${c.postal}` : 'NO POSTAL'), h('small', null, up(c.location || 'Location unknown')))),
+        c.hazards ? C.hitBanner(`HAZARDS: ${up(c.hazards)}`, 'amber') : null,
+        h('div', { class: 'steps' },
+          step('enroute', 'En Route (10-76)'), step('onscene', 'On Scene (10-97)'), app.role === 'fire' ? step('transport', 'Transporting') : null,
+          h('button', { class: 'btn', onclick: () => app.map?.focusCall(c.id) }, icon('pin', 16), 'Locate'),
+          h('button', { class: 'btn', title: 'Show a route to this call on the map', onclick: () => { app.routeDismissed = null; C.routeToCall(c); } }, icon('map', 16), 'Directions'),
+          h('button', { class: 'btn', onclick: () => C.closeCallDialog(c) }, icon('check', 16), 'Close Call'),
+          h('button', { class: 'btn', onclick: () => act('detach', { id: c.id }, 'Cleared from the call (10-8).') }, 'Clear (10-8)')),
+        h('div', { class: 'groups' },
+          group('Caller', h('div', { class: 'kv one' }, h('div', null, h('b', null, 'NAME:'), up(c.caller || 'UNKNOWN')), h('div', null, h('b', null, 'CALLBACK:'), c.callback || '--'))),
+          group(`Units (${c.units.length})`, h('div', { class: 'unit-chips' }, c.units.map((x) => h('span', { class: 'chip', style: `--st:${STATUS_COLOR[x.status] || '#888'}` }, h('b', null, x.callsign), statusText(x.status) || 'CLEARED')))),
+          h('fieldset', { class: 'group full' }, h('legend', null, 'Details'), h('div', { class: 'details-text' }, c.details || 'No details.')),
+          h('fieldset', { class: 'group full' }, h('legend', null, `Notes (${c.notes.length})`),
+            h('div', { class: 'notes-list tall' }, c.notes.length ? c.notes.map((n) => h('div', { class: n.public ? 'pub' : '' }, h('b', null, `${clock(n.at)} ${n.by}: `), n.text)) : 'No notes.'),
+            h('form', { class: 'inline-form', onsubmit: (e) => { e.preventDefault(); if (noteInput.value.trim()) act('addNote', { id: c.id, text: noteInput.value }); } }, noteInput, h('button', { class: 'btn', type: 'submit' }, 'Add Note')))),
+      ];
+    });
+    return box;
+  }
+
+  function historyPage() {
+    const box = h('div');
+    bind(box, (d) => (d.calls || []).filter((c) => !isOpen(c)).map((c) => c.id), () => {
+      const mine = (app.data.calls || []).filter((c) => !isOpen(c) && (c.units.some((u) => u.userId === me()) || c.depts.includes(app.role)));
+      return [
+        h('div', { class: 'btnrow left', style: 'padding:0 0 6px' }, h('button', { class: 'btn', onclick: () => C.getCallDialog() }, icon('getcall', 16), 'Get Call by Number…'), h('button', { class: 'btn', onclick: C.timecardDialog }, icon('timecard', 16), 'My Timecard…')),
+        h('div', { class: 'mini-grid tall' }, grid([
+          { label: 'ID', render: (c) => String(c.num) },
+          { label: 'Received', render: (c) => stamp(c.at) },
+          { label: 'Call', render: (c) => up(`${c.code || ''} ${callTitle(c)}`.trim()) },
+          { label: 'Address', render: (c) => up(c.location) },
+          { label: 'Units', render: (c) => c.units.map((u) => u.callsign).join(' ') },
+          { label: 'Disposition', render: (c) => up(c.disposition) },
+          { label: '', render: (c) => btn('View', () => C.getCallDialog(String(c.num))) },
+        ], mine, { rowClass: (c) => (c.units.some((u) => u.userId === me()) ? 'mine' : ''), empty: 'No closed calls yet.' })),
+      ];
+    });
+    return box;
+  }
+
+  function lookupPage() {
+    const panel = C.lookupPanel();
+    panel.inline = true;
+    app.lookup = panel;
+    return panel.el;
+  }
+
+  function recordsPage() {
+    const box = h('div');
+    let tab = 'records';
+    bind(box, (d) => [d.records, d.warrants, d.reports, tab], () => [
+      h('div', { class: 'btnrow left', style: 'padding:0 0 6px' },
+        h('button', { class: 'btn', onclick: () => C.openLookup('name') }, icon('lookup', 16), 'Find Person…'),
+        h('button', { class: 'btn', onclick: C.reportDialog }, icon('report', 16), 'New Report…'),
+        h('button', { class: 'btn', onclick: () => C.towRequestDialog() }, icon('tow', 16), 'Request Tow…')),
+      tabStrip([['records', 'Recent Citations & Arrests'], ['warrants', 'Active Warrants'], ['reports', 'Reports']], tab, (t) => { tab = t; refreshNow(); }),
+      h('div', { class: 'tab-page', style: 'margin:0' },
+        tab === 'records' ? C.recordsGrid(app.data.records || [], true) : tab === 'warrants' ? C.warrantsGrid(app.data.warrants || [], true) : C.reportsGrid(app.data.reports || [])),
+      h('p', { class: 'muted' }, 'To write a citation or suspend a license, look up the person and use the buttons on their record.'),
+    ]);
+    return box;
+  }
+
+  function bolosPage() {
+    const box = h('div');
+    bind(box, (d) => d.bolos, () => [
+      h('div', { class: 'btnrow left', style: 'padding:0 0 6px' }, h('button', { class: 'btn', onclick: () => C.boloDialog() }, icon('bolo', 16), 'New BOLO…')),
+      h('div', { class: 'bolo-cards' }, (app.data.bolos || []).length ? app.data.bolos.map((b) => h('div', { class: `bolo-card ${b.kind}` },
+        h('div', { class: 'bc-head' }, icon(b.kind === 'vehicle' ? 'car' : 'user', 20), h('b', null, `BOLO ${b.num || ''}`), h('small', null, stamp(b.at))),
+        h('div', { class: 'bc-subj' }, up(b.subject)),
+        b.plate ? h('div', null, h('b', null, 'PLATE: '), h('a', { href: '#', onclick: (e) => { e.preventDefault(); C.openLookup('plate', b.plate); } }, b.plate)) : null,
+        b.details ? h('div', { class: 'muted' }, b.details) : null,
+        h('div', { class: 'bc-foot' }, h('small', null, `By ${b.by}`), btn('Clear', () => act('clearBolo', { id: b.id }, 'BOLO cleared.'))))) : h('div', { class: 'empty' }, 'No active BOLOs.')),
+    ]);
+    return box;
+  }
+
+  // ---------- Fire / EMS: patients and fire reports ----------
+
+  const TRIAGE = [['red', 'Immediate'], ['yellow', 'Delayed'], ['green', 'Minor'], ['black', 'Expectant']];
+  const TREATMENTS = [['ccollar', 'C-collar'], ['longboard', 'Long board'], ['splint', 'Splint'], ['oxygen', 'Oxygen'], ['iv', 'IV access'], ['pain', 'Pain management'], ['cpr', 'CPR'], ['aed', 'AED'], ['bleeding', 'Bleeding control']];
+  const PT_STATUS_CLS = { 'on scene': 'tx-busy', transporting: 'tx-enroute', delivered: 'tx-available', refused: 'tx-unavailable' };
+
+  function patientDialog(existing) {
+    const p = existing || {};
+    const call = existing ? null : C.myOpenCall();
+    const f = {};
+    const inp = (name, value, attrs = {}) => (f[name] = h('input', { value: value ?? '', maxlength: 160, ...attrs }));
+    let triage = p.triage || 'yellow';
+    const triageRow = h('div', { class: 'triage' });
+    const drawTriage = () => triageRow.replaceChildren(...TRIAGE.map(([k, l]) => h('button', { type: 'button', class: `tri ${k} ${triage === k ? 'on' : ''}`, onclick: () => { triage = k; drawTriage(); } }, l)));
+    drawTriage();
+    const treat = TREATMENTS.map(([k, l]) => { f[`t_${k}`] = h('input', { type: 'checkbox', checked: Boolean(p.treatment?.[k]) }); return h('label', { class: 'inline-check' }, f[`t_${k}`], l); });
+    const vitalsBox = h('div');
+    const vIn = { bp: h('input', { placeholder: '120/80', maxlength: 10 }), hr: h('input', { placeholder: 'HR', maxlength: 4 }), rr: h('input', { placeholder: 'RR', maxlength: 4 }), spo2: h('input', { placeholder: 'SpO2', maxlength: 4 }), gcs: h('input', { placeholder: 'GCS', maxlength: 4 }) };
+    let id = p.id || null;
+    const live = () => (app.data.patients || []).find((x) => x.id === id);
+    bind(vitalsBox, () => [id, live()?.vitals, live()?.status], () => {
+      const cur = live();
+      return [
+        h('div', { class: 'mini-grid' }, grid([
+          { label: 'Time', render: (v) => clock(v.at) }, { label: 'BP', render: (v) => v.bp }, { label: 'HR', render: (v) => v.hr }, { label: 'RR', render: (v) => v.rr }, { label: 'SpO2', render: (v) => (v.spo2 ? `${v.spo2}%` : '') }, { label: 'GCS', render: (v) => v.gcs },
+        ], cur?.vitals || [], { key: (v) => v.at, empty: id ? 'No vitals yet.' : 'Save the patient first, then add vitals.' })),
+        id ? h('div', { class: 'inline-form vitals-in' }, vIn.bp, vIn.hr, vIn.rr, vIn.spo2, vIn.gcs, h('button', { class: 'btn btn-small', type: 'button', onclick: async () => {
+          const body = Object.fromEntries(Object.entries(vIn).map(([k, el]) => [k, el.value.trim()]));
+          if (!Object.values(body).some(Boolean)) return toast('Enter at least one vital sign.', 'error');
+          if (await act('addVitals', { id, ...body }, 'Vitals recorded.')) Object.values(vIn).forEach((el) => { el.value = ''; });
+        } }, icon('vitals', 14), 'Add Vitals')) : null,
+        cur ? h('div', { class: 'btnrow left' }, h('b', null, `Status: ${up(cur.status)}`),
+          ['transporting', 'delivered', 'refused'].map((s) => btn(s === 'refused' ? 'Refused Care' : s === 'delivered' ? 'Delivered' : 'Begin Transport', () => act('patientStatus', { id, status: s }, `Patient ${s}.`), cur.status === s ? 'pressed' : ''))) : null,
+      ];
+    });
+    const save = async () => {
+      const body = {
+        id, callId: call?.id || p.callId || null, name: f.name.value, age: f.age.value, sex: f.sex.value, triage, mechanism: f.mechanism.value, complaint: f.complaint.value,
+        treatment: Object.fromEntries(TREATMENTS.map(([k]) => [k, f[`t_${k}`].checked])), transportUnit: f.transportUnit.value, destination: f.destination.value, transportPriority: f.transportPriority.value,
+      };
+      const res = await act('savePatient', body, 'Patient saved.');
+      if (res?.id) { id = res.id; d.setTitle(`Patient Care - ${body.name || 'Unknown patient'}`); refreshNow(); }
+    };
+    f.sex = h('select', null, ['', 'Male', 'Female', 'Unknown'].map((x) => h('option', { value: x, selected: p.sex === x }, x || '--')));
+    f.destination = h('select', null, ['', 'Fulton General Hospital', 'Grady Trauma Center', 'County Medical Center', 'Burn Unit', 'Refused transport'].map((x) => h('option', { value: x, selected: p.destination === x }, x || '--')));
+    f.transportPriority = h('select', null, ['', 'Priority 1 - Lights and siren', 'Priority 2 - Urgent', 'Priority 3 - Non-emergent'].map((x) => h('option', { value: x, selected: p.transportPriority === x }, x || '--')));
+    const content = h('div', { class: 'patient' },
+      h('div', { class: 'groups' },
+        group('Patient', frow('Name:', inp('name', p.name, { maxlength: 60, placeholder: 'Unknown' })), frow('Age:', inp('age', p.age, { maxlength: 4 })), frow('Sex:', f.sex)),
+        group('Triage', triageRow, frow('Mechanism:', inp('mechanism', p.mechanism, { maxlength: 80, placeholder: 'MVA, fall, burn…' })), frow('Complaint:', inp('complaint', p.complaint, { placeholder: 'Chest pain, laceration…' }))),
+        h('fieldset', { class: 'group full' }, h('legend', null, 'Treatment'), h('div', { class: 'check-grid' }, treat)),
+        h('fieldset', { class: 'group full' }, h('legend', null, 'Vitals'), vitalsBox),
+        group('Transport', frow('Unit:', inp('transportUnit', p.transportUnit || app.data.myUnit?.callsign || '', { maxlength: 40 })), frow('Destination:', f.destination), frow('Priority:', f.transportPriority))),
+      h('div', { class: 'btnrow' }, h('button', { class: 'btn btn-default', onclick: save }, 'Save Patient'), h('button', { class: 'btn', onclick: () => d.close() }, 'Close')));
+    const d = openDialog({ id: `pt-${p.id || 'new'}`, title: existing ? `Patient Care - ${p.name || 'Unknown patient'}` : `New Patient${call ? ` - Call #${call.num}` : ''}`, width: 680, icon: 'patient', content });
+  }
+
+  function patientsPage() {
+    const box = h('div');
+    bind(box, (d) => d.patients, () => {
+      const list = app.data.patients || [];
+      return [
+        h('div', { class: 'btnrow left', style: 'padding:0 0 6px' }, h('button', { class: 'btn btn-default', onclick: () => patientDialog() }, icon('patient', 16), 'New Patient…')),
+        h('div', { class: 'mini-grid tall' }, grid([
+          { label: 'Time', render: (p) => clock(p.at) },
+          { label: 'Call', render: (p) => (p.callNum ? `#${p.callNum}` : '') },
+          { label: 'Triage', render: (p) => up(p.triage), cls: (p) => `cell tri-${p.triage}` },
+          { label: 'Patient', render: (p) => up(p.name || 'Unknown') },
+          { label: 'Age/Sex', render: (p) => [p.age, p.sex?.[0]].filter(Boolean).join(' ') },
+          { label: 'Complaint', render: (p) => up(p.complaint) },
+          { label: 'Vitals', render: (p) => { const v = p.vitals?.[p.vitals.length - 1]; return v ? [v.bp, v.hr && `HR ${v.hr}`, v.spo2 && `${v.spo2}%`].filter(Boolean).join(' ') : '--'; } },
+          { label: 'Destination', render: (p) => up(p.destination) },
+          { label: 'Status', render: (p) => up(p.status), cls: (p) => PT_STATUS_CLS[p.status] },
+          { label: '', render: (p) => btn('Open', () => patientDialog(p)) },
+        ], list, { onOpen: patientDialog, empty: 'No patients yet. Add one from a medical call.' })),
+      ];
+    });
+    return box;
+  }
+
+  const FIRE_ACTIONS = [['safety', 'Scene safety'], ['search', 'Primary search'], ['suppression', 'Fire suppression'], ['ventilation', 'Ventilation'], ['overhaul', 'Overhaul'], ['extrication', 'Extrication'], ['patient', 'Patient care'], ['spill', 'Spill control']];
+  function fireReportDialog(existing) {
+    const r = existing || {};
+    const call = existing ? null : C.myOpenCall();
+    const locked = Boolean(r.submitted);
+    const send = (submit) => (v) => act('saveFireReport', {
+      id: r.id, callId: call?.id || r.callId || null, incidentType: v.incidentType, property: v.property, loss: v.loss, summary: v.summary, submit,
+      actions: Object.fromEntries(FIRE_ACTIONS.map(([k]) => [k, v[`a_${k}`]])),
+    }, submit ? 'Fire report submitted.' : 'Draft saved.');
+    formDialog({
+      title: locked ? `Fire Report - ${r.title}` : existing ? `Fire Report (Draft) - ${r.title}` : `New Fire Report${call ? ` - Call #${call.num}` : ''}`,
+      submitLabel: locked ? 'Close' : 'Submit Report',
+      cancelLabel: locked ? 'Cancel' : 'Save Draft',
+      onCancel: locked ? undefined : async (dlg, vals) => { if (await send(false)(vals)) dlg.close(); },
+      icon: 'fire',
+      width: 600,
+      fields: [
+        { name: 'incidentType', label: 'Incident type', type: 'select', value: r.incidentType, options: ['Structure fire', 'Vehicle fire', 'Brush / grass fire', 'Dumpster fire', 'Fire alarm', 'Smoke investigation', 'Gas leak', 'Hazmat', 'Rescue', 'Lift assist'].map((x) => [x, x]) },
+        { name: 'loss', label: 'Est. loss', value: r.loss, max: 40, placeholder: '$25,000' },
+        { name: 'property', label: 'Property / address', value: r.property || call?.location || '', wide: true, max: 120 },
+        { type: 'html', el: h('b', null, 'Actions taken') },
+        ...FIRE_ACTIONS.map(([k, l]) => ({ name: `a_${k}`, label: l, type: 'checkbox', value: r.actions?.[k] })),
+        { name: 'summary', label: 'Narrative', type: 'textarea', rows: 7, value: r.body, max: 4000 },
+      ],
+      onSubmit: locked ? () => true : send(true),
+    });
+  }
+
+  function fireReportsPage() {
+    const box = h('div');
+    bind(box, (d) => d.reports, () => {
+      const list = (app.data.reports || []).filter((r) => r.kind === 'fire' || r.dept === 'fire');
+      return [
+        h('div', { class: 'btnrow left', style: 'padding:0 0 6px' }, h('button', { class: 'btn btn-default', onclick: () => fireReportDialog() }, icon('fire', 16), 'New Fire Report…'), h('button', { class: 'btn', onclick: C.reportDialog }, icon('report', 16), 'Other Report…')),
+        h('div', { class: 'mini-grid tall' }, grid([
+          { label: 'Date', render: (r) => stamp(r.at) },
+          { label: 'Call', render: (r) => (r.callNum ? `#${r.callNum}` : '') },
+          { label: 'Title', render: (r) => up(r.title) },
+          { label: 'Property', render: (r) => up(r.property || r.location) },
+          { label: 'Loss', render: (r) => r.loss || '' },
+          { label: 'By', render: (r) => up(r.by) },
+          { label: 'State', render: (r) => (r.submitted === false ? 'DRAFT' : 'SUBMITTED'), cls: (r) => (r.submitted === false ? 'tx-busy' : 'tx-available') },
+          { label: '', render: (r) => btn(r.submitted === false ? 'Edit' : 'View', () => (r.kind === 'fire' ? fireReportDialog(r) : null)) },
+        ], list, { empty: 'No fire reports yet.' })),
+      ];
+    });
+    return box;
+  }
+
+  // ---------- DOT: tows, hazards and impounds ----------
+
+  const TOW_FLOW = [['accepted', 'Accept'], ['enroute', 'En Route'], ['hooked', 'Hooked'], ['delivered', 'Delivered']];
+  const TOW_CLS = { new: 'st-pending', accepted: 'st-enroute', enroute: 'st-enroute', hooked: 'st-busy', delivered: 'st-available', declined: 'st-closed' };
+
+  function towsPage() {
+    const box = h('div');
+    let sel = null;
+    bind(box, (d) => [d.tows, sel], () => {
+      const list = app.data.tows || [];
+      const t = list.find((x) => x.id === sel);
+      return [
+        h('div', { class: 'mini-grid' }, grid([
+          { label: 'Tow', render: (x) => x.num },
+          { label: 'Time', render: (x) => clock(x.at) },
+          { label: 'Plate', render: (x) => x.plate || '--' },
+          { label: 'Vehicle', render: (x) => up(x.vehicle) },
+          { label: 'Location', render: (x) => `${x.postal ? `${x.postal} ` : ''}${up(x.location)}` },
+          { label: 'Reason', render: (x) => up(x.reason) },
+          { label: 'Hold', render: (x) => (x.hold ? 'HOLD' : ''), cls: (x) => (x.hold ? 'tx-panic' : '') },
+          { label: 'Unit', render: (x) => x.assignedLabel || '--' },
+          { label: 'Status', render: (x) => up(x.status), cls: (x) => `cell ${TOW_CLS[x.status]}` },
+          { label: 'Wait', render: (x) => (['delivered', 'declined'].includes(x.status) ? '' : since(x.at)) },
+        ], list, { selected: sel, onSelect: (x) => { sel = x.id; refreshNow(); }, rowClass: (x) => (x.status === 'new' ? 'pending' : ''), empty: 'No tow requests.' })),
+        t ? h('div', { class: 'result tow-card' },
+          h('h4', null, icon('tow', 20), `Tow ${t.num}`, flag(up(t.status), t.status === 'new' ? 'amber' : t.status === 'delivered' ? 'green' : 'blue'), t.hold ? flag('HOLD', 'red') : null, t.callNum ? flag(`CALL #${t.callNum}`, 'gray') : null),
+          h('div', { class: 'kv' }, [['PLATE', t.plate], ['VIN', t.vin], ['VEHICLE', t.vehicle], ['REASON', t.reason], ['CONDITION', t.condition], ['DESTINATION', t.destination], ['LOCATION', `${t.postal ? `${t.postal} ` : ''}${t.location}`], ['REQUESTED', `${t.requestedBy} ${clock(t.at)}`], ['HOLD', t.hold]].filter(([, v]) => v).map(([k, v]) => h('div', null, h('b', null, `${k}:`), up(v)))),
+          h('div', { class: 'btnrow left' },
+            TOW_FLOW.map(([s, l]) => btn(l, () => act('towStatus', { id: t.id, status: s }, `Tow ${t.num} ${s}.`), t.status === s ? 'pressed' : '')),
+            btn('Decline', () => act('towStatus', { id: t.id, status: 'declined' }, `Tow ${t.num} declined.`), 'btn-danger'),
+            btn('Edit…', () => formDialog({ title: `Tow ${t.num}`, submitLabel: 'Save', icon: 'tow', fields: [
+              { name: 'reason', label: 'Reason', value: t.reason, max: 80 }, { name: 'destination', label: 'Destination', value: t.destination, max: 80 }, { name: 'condition', label: 'Condition', value: t.condition, wide: true, max: 120 },
+            ], onSubmit: (v) => act('towStatus', { id: t.id, status: t.status, ...v }, 'Tow updated.') })),
+            t.plate ? btn('Run Plate', () => C.openLookup('plate', t.plate)) : null,
+            Number.isFinite(t.x) ? btn('Locate', () => app.map?.center(t.x, t.z, 1.2)) : null)) : h('div', { class: 'empty' }, 'Select a tow request to work it. Delivered tows to the impound lot are impounded automatically.'),
+      ];
+    });
+    return box;
+  }
+
+  function hazardsPage() {
+    const box = h('div');
+    bind(box, (d) => d.hazards, () => {
+      const list = app.data.hazards || [];
+      return [
+        h('div', { class: 'btnrow left', style: 'padding:0 0 6px' }, h('button', { class: 'btn btn-default', onclick: () => C.hazardDialog() }, icon('hazard', 16), 'Report Road Hazard…')),
+        h('div', { class: 'mini-grid tall' }, grid([
+          { label: 'No.', render: (x) => x.num },
+          { label: 'Time', render: (x) => clock(x.at) },
+          { label: 'Hazard', render: (x) => up(x.hazard) },
+          { label: 'Location', render: (x) => `${x.postal ? `${x.postal} ` : ''}${up(x.location)}` },
+          { label: 'Dir', render: (x) => up(x.direction) },
+          { label: 'Lanes', render: (x) => up(x.lanes) },
+          { label: 'Controls', render: (x) => Object.entries(x.controls || {}).filter(([k, v]) => v && k !== 'broadcast').map(([k]) => up(k)).join(' ') || '--' },
+          { label: 'Clear', render: (x) => (x.estClear ? `${x.estClear} MIN` : '') },
+          { label: 'Status', render: (x) => up(x.status), cls: (x) => `cell ${x.status === 'open' ? 'st-pending' : 'st-available'}` },
+          { label: '', render: (x) => (x.status === 'open' ? C.actionsCell(btn('Edit', () => C.hazardDialog(x)), btn('Clear', () => act('clearHazard', { id: x.id }, `Hazard ${x.num} cleared.`))) : '') },
+        ], list, { empty: 'No road hazards reported.' })),
+      ];
+    });
+    return box;
+  }
+
+  function impoundPage() {
+    const box = h('div');
+    bind(box, (d) => d.impounds, () => [
+      h('div', { class: 'btnrow left', style: 'padding:0 0 6px' }, h('button', { class: 'btn', onclick: () => showTab('lookup') }, icon('lookup', 16), 'Plate Lookup to Impound…')),
+      C.impoundGrid(app.data.impounds || []),
+    ]);
+    return box;
+  }
+
+  function wrapWin(el) { return h('div', { class: 'tab-win' }, el); }
+
+  const PAGES = {
+    mycall: myCallPage,
+    calls: () => h('div', { class: 'tab-split' }, C.callsWindow('tw-calls'), C.viewerWindow('tw-viewer')),
+    lookup: lookupPage,
+    records: recordsPage,
+    bolos: bolosPage,
+    units: () => wrapWin(C.unitsWindow('tw-units')),
+    messages: () => C.messagesPanel(),
+    history: historyPage,
+    patients: patientsPage,
+    firereports: fireReportsPage,
+    tows: towsPage,
+    hazards: hazardsPage,
+    impound: impoundPage,
+  };
+
+  function tabbedWorkspace(ws) {
+    const tabs = TABS[app.role];
+    if (!tabs.some(([k]) => k === app.mdtTab)) app.mdtTab = 'mycall';
+    const strip = h('div', { class: 'mdt-tabs' });
+    const page = h('div', { class: 'mdt-page' });
+    const counts = (d, k) => {
+      if (k === 'calls') return (d.calls || []).filter((c) => isOpen(c) && c.depts.includes(app.role) && c.status === 'pending').length;
+      if (k === 'bolos') return (d.bolos || []).length;
+      if (k === 'tows') return (d.tows || []).filter((t) => t.status === 'new').length;
+      if (k === 'hazards') return (d.hazards || []).filter((x) => x.status === 'open').length;
+      if (k === 'patients') return (d.patients || []).filter((p) => ['on scene', 'transporting'].includes(p.status)).length;
+      if (k === 'mycall') return C.myOpenCall() ? 1 : 0;
+      return 0;
+    };
+    const kept = {};
+    showTab = (k) => {
+      app.mdtTab = k;
+      // Lookup keeps its results when switching tabs.
+      if (!kept[k] || k !== 'lookup') kept[k] = PAGES[k]();
+      page.replaceChildren(kept[k]);
+      if (app.lookup?.inline && k !== 'lookup' && !document.body.contains(app.lookup.el)) { /* lookup kept for later */ }
+      refreshNow();
+    };
+    bind(strip, (d) => [app.mdtTab, tabs.map(([k]) => counts(d, k))], () => tabs.map(([k, l]) => {
+      const n = counts(app.data, k);
+      return h('button', { class: `mdt-tab ${app.mdtTab === k ? 'active' : ''}`, onclick: () => showTab(k) }, l, n ? h('span', { class: `badge ${k === 'mycall' ? 'green' : ''}` }, k === 'mycall' ? 'ON' : String(n)) : null);
+    }));
+    const side = h('div', { class: 'mdt-side' }, C.mapWindow('w-map', { follow: true, compact: true }));
+    ws.append(h('div', { class: 'mdt-main raised' }, strip, page), side);
+    C.onLookupFocus = tabs.some(([k]) => k === 'lookup') ? () => { if (app.mdtTab !== 'lookup') showTab('lookup'); } : null;
+    showTab(app.mdtTab);
+  }
+
+  function boardWorkspace(ws) {
+    ws.append(
+      h('div', { class: 'col-stack' }, C.callsWindow('w-calls'), C.viewerWindow('w-viewer')),
+      h('div', { class: 'col-stack' }, C.mapWindow('w-map', { follow: false }), C.unitsWindow('w-units')));
+    showTab = (k) => { if (k === 'mycall') { const c = C.myOpenCall(); if (c) selectCall(c.id); } };
+    C.onLookupFocus = null;
+  }
+
+  function unitConsole() {
+    const role = app.role;
+    const layout = prefs().mdtLayout;
+    app.lookup = null;
+    const onDuty = () => Boolean(app.data.myUnit);
+    const clockTool = h('span', { style: 'display:contents' });
+    bind(clockTool, (d) => Boolean(d.myUnit), (on) => tool(on ? 'Clock Out' : 'Clock In', on ? 'power' : 'clockin', () => (on ? confirmDialog('Clock Out', 'Clock out (10-42)? You will be removed from any call you are on.', 'Clock Out', () => act('goOffDuty', {}, 'Clocked out (10-42).')) : C.logOnDialog()), { title: on ? 'End your shift' : 'Start your shift' }));
+    const setLayout = (v) => setPrefs({ mdtLayout: v }).then(() => C.renderConsole());
+    const tools = [
+      clockTool,
+      tool('Self-Init', 'newcall', () => C.newCallDialog(), { title: 'Self-initiated call (F2)' }),
+      role !== 'fire' ? tool('Lookup', 'lookup', () => C.openLookup(), { title: 'Lookup (F7)' }) : tool('Patients', 'patient', () => (layout === 'tabbed' ? showTab('patients') : patientDialog())),
+      role === 'police' ? tool('BOLOs', 'bolo', C.bolosDialog, { title: 'BOLOs (F8)' }) : null,
+      role === 'dot' ? tool('Tows', 'tow', () => (layout === 'tabbed' ? showTab('tows') : C.recordsDialog())) : null,
+      tool('Records', 'records', C.recordsDialog),
+      tool('History', 'history', C.callHistoryDialog),
+      sep(),
+      tool('Notepad', 'notepad', C.notepadDialog),
+      tool('10-Codes', 'codes', C.tenCodesDialog),
+      tool('Messages', 'messages', C.messagesDialog),
+      tool('Location', 'pin', C.locationDialog),
+      sep(),
+      tool('Layout', 'layout', () => setLayout(layout === 'tabbed' ? 'board' : 'tabbed'), { title: layout === 'tabbed' ? 'Switch to the four pane board' : 'Switch to the tabbed MDT' }),
+      tool('Preferences', 'settings', C.prefsDialog),
+      tool('Timecard', 'timecard', C.timecardDialog),
+      h('span', { class: 'tool-spacer' }),
+      tool('Sign Off', 'signoff', C.signOff),
+    ];
+    const ws = shell({
+      workspaceClass: layout === 'tabbed' ? 'mdt-tabbed' : 'mdt',
+      menus: [
+        fileMenu([{ label: 'Clock In…', icon: 'clockin', run: C.logOnDialog }, { label: 'Clock Out', icon: 'power', run: () => act('goOffDuty', {}, 'Clocked out (10-42).') }, { label: 'Timecard…', icon: 'timecard', run: C.timecardDialog }, '-']),
+        ['Unit', [
+          ...SETTABLE[role].map((s) => ({ label: `${STATUS[s].code} ${STATUS[s].label}`, disabled: !onDuty(), run: () => act('setStatus', { status: s }) })),
+          '-',
+          { label: 'Set Location…', icon: 'pin', run: C.locationDialog },
+          role === 'fire' ? { label: 'Crew and Apparatus…', icon: 'units', run: () => formDialog({ title: 'Crew and Apparatus', submitLabel: 'Save', icon: 'units', fields: [{ name: 'apparatus', label: 'Apparatus', value: app.data.myUnit?.apparatus || '', max: 40 }, { name: 'crew', label: 'Crew', value: app.data.myUnit?.crew || '', wide: true, max: 120 }], onSubmit: (v) => act('updateUnit', v, 'Unit updated.') }) } : null,
+          { label: 'Request Backup…', icon: 'backup', run: C.backupDialog },
+          { label: 'Panic (10-33)', icon: 'siren', run: C.panicConfirm },
+        ]],
+        ['Calls', [
+          { label: 'Self-Initiated Call…', key: 'F2', icon: 'newcall', run: () => C.newCallDialog() },
+          role === 'police' ? { label: 'Traffic Stop…', icon: 'trafficstop', run: trafficStopDialog } : null,
+          { label: 'My Call', icon: 'viewer', run: () => showTab('mycall') },
+          { label: 'Get Call…', key: 'F4', icon: 'getcall', run: () => C.getCallDialog() },
+          { label: 'Call History…', icon: 'history', run: C.callHistoryDialog },
+          { label: 'Add Note…', run: C.need(C.noteDialog) },
+          { label: 'Close Call…', run: () => { const c = C.myOpenCall(); if (!c) return toast('You are not on a call.', 'error'); return C.closeCallDialog(c); } },
+        ]],
+        ['Records', [
+          role !== 'fire' ? { label: 'Lookup…', key: 'F7', icon: 'lookup', run: () => C.openLookup() } : null,
+          { label: 'Records Management…', icon: 'records', run: C.recordsDialog },
+          role === 'police' ? { label: 'BOLOs…', key: 'F8', icon: 'bolo', run: C.bolosDialog } : null,
+          role === 'police' ? { label: 'New BOLO…', run: () => C.boloDialog() } : null,
+          role === 'fire' ? { label: 'New Patient…', icon: 'patient', run: () => patientDialog() } : null,
+          role === 'fire' ? { label: 'New Fire Report…', icon: 'fire', run: () => fireReportDialog() } : null,
+          role === 'dot' ? { label: 'Report Road Hazard…', icon: 'hazard', run: () => C.hazardDialog() } : null,
+          role !== 'dot' ? { label: 'Request Tow…', icon: 'tow', run: () => C.towRequestDialog() } : null,
+          { label: 'New Report…', icon: 'report', run: C.reportDialog },
+        ]],
+        ['View', [
+          { label: 'Tabbed MDT', checked: layout === 'tabbed', run: () => setLayout('tabbed') },
+          { label: 'Four Pane Board', checked: layout === 'board', run: () => setLayout('board') },
+          '-',
+          { label: 'Whole Map', key: 'F9', icon: 'map', run: () => app.map?.fit() },
+          { label: 'Map in a Window', run: C.mapDialog },
+        ]],
+        toolsMenu([{ label: 'Messages', icon: 'messages', run: C.messagesDialog }]),
+        helpMenu(),
+      ],
+      tools,
+      topbar: topbar(),
+      hint: h('span', null, h('b', null, 'F2'), ' Self-Init · ', h('b', null, 'F4'), ' Get Call · ', role !== 'fire' ? [h('b', null, 'F7'), ' Lookup · '] : null, h('b', null, 'F9'), ' Map · ST 10-97 sets status'),
+      statusItems: (d) => [
+        h('span', null, d.myUnit ? `${d.myUnit.callsign} ${statusText(d.myUnit.status)}` : 'Off duty'),
+        h('span', null, `Units: ${(d.units || []).length}`),
+        h('span', null, `Open calls: ${(d.calls || []).filter((c) => isOpen(c) && c.depts.includes(role)).length}`),
+      ],
+    });
+    if (layout === 'tabbed') tabbedWorkspace(ws);
+    else boardWorkspace(ws);
+    if (!app.data.myUnit) setTimeout(C.logOnDialog, 50);
+  }
+
+  // Dispatch sent us to a call: open it.
+  C.onAssigned = () => showTab('mycall');
+
+  for (const role of ['police', 'fire', 'dot']) C.consoles[role] = unitConsole;
+  Object.assign(C, { patientDialog, fireReportDialog, trafficStopDialog, mutualAidDialog });
+})();
